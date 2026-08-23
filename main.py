@@ -7,7 +7,6 @@ import requests
 
 app = FastAPI()
 
-# Permitir peticiones desde tu Frontend en GitHub Pages
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -16,11 +15,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- SISTEMA DE CACHÉ PARA AHORRAR PETICIONES ---
+# Sistema de Caché en memoria (4 horas de duración)
 cache_store = {}
-CACHE_DURATION = (
-    14400  # 4 horas en segundos (los datos de un partido no cambian)
-)
+CACHE_DURATION = 14400
 
 
 def poisson(k, lambd):
@@ -39,15 +36,17 @@ def get_hash_factor(name: str):
 
 @app.get("/")
 def home():
-  return {"status": "Backend activo, optimizado con Caché y API Key fija"}
+  return {"status": "Backend activo y optimizado con Caché"}
 
 
-# --- ENDPOINT 1: Obten los partidos del día para la lista ---
+# Endpoint 1: Obtener lista de partidos del día
 @app.get("/matches")
 def get_matches(date: str):
   api_key = os.environ.get("API_SPORTS_KEY")
   if not api_key:
-    return {"error": "API Key no configurada en las variables de entorno"}
+    return {
+        "error": "API Key no configurada en las variables de entorno de Render"
+    }
 
   headers = {"x-apisports-key": api_key}
   url = f"https://v3.football.api-sports.io/fixtures?date={date}"
@@ -56,21 +55,18 @@ def get_matches(date: str):
     response = requests.get(url, headers=headers, timeout=10)
     return response.json()
   except Exception as e:
-    return {"error": f"Error de conexión: {str(e)}"}
+    return {"error": f"Error consultando partidos: {str(e)}"}
 
 
-# --- ENDPOINT 2: Analiza las alineaciones y probabilidades del partido ---
+# Endpoint 2: Analizar fixture y calcular probabilidades
 @app.get("/analyze-fixture")
 def analyze_fixture(fixture: str):
   now = time.time()
 
-  # 1. Si el partido ya está en caché y sigue vigente, se devuelve de inmediato (0 peticiones gastadas)
+  # 1. Si el partido ya fue consultado recientemente, se devuelve de la caché (0 peticiones gastadas)
   if fixture in cache_store:
     cached_data, timestamp = cache_store[fixture]
     if now - timestamp < CACHE_DURATION:
-      print(
-          f"Sirviendo partido {fixture} desde la Caché local (Petición libre)"
-      )
       return cached_data
 
   # 2. Si no está en caché, consulta a API-Sports usando la clave fija de Render
@@ -205,9 +201,6 @@ def analyze_fixture(fixture: str):
         })
 
   final_response = {"players": players_result}
-
-  # 3. Guardar el resultado procesado en la caché antes de devolverlo
   cache_store[fixture] = (final_response, now)
-
   return final_response
     
