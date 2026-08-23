@@ -1,4 +1,6 @@
 import math
+import os
+import time
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import requests
@@ -12,6 +14,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Sistema de caché (guarda los partidos por 4 horas para no gastar tus 100 peticiones diarias)
+cache_store = {}
+CACHE_DURATION = 14400
 
 
 def poisson(k, lambd):
@@ -30,11 +36,27 @@ def get_hash_factor(name: str):
 
 @app.get("/")
 def home():
-  return {"status": "Backend activo"}
+  return {"status": "Backend activo y optimizado"}
 
 
 @app.get("/analyze-fixture")
-def analyze_fixture(fixture: str, api_key: str):
+def analyze_fixture(fixture: str):
+  now = time.time()
+
+  # Si el partido ya fue consultado antes, responde al instante sin gastar peticiones
+  if fixture in cache_store:
+    cached_data, timestamp = cache_store[fixture]
+    if now - timestamp < CACHE_DURATION:
+      return cached_data
+
+  # Lee la clave que guardaste en las variables de entorno de Render
+  api_key = os.environ.get("API_SPORTS_KEY")
+  if not api_key:
+    return {
+        "players": [],
+        "error": "API Key no configurada en las variables de entorno de Render",
+    }
+
   headers = {"x-apisports-key": api_key}
   url = f"https://v3.football.api-sports.io/fixtures/lineups?fixture={fixture}"
 
@@ -46,7 +68,6 @@ def analyze_fixture(fixture: str, api_key: str):
 
   players_result = []
 
-  # Verificar que existan alineaciones confirmadas
   if "response" in data and isinstance(data["response"], list):
     for team_index, team_data in enumerate(data["response"]):
       is_home = team_index == 0
@@ -159,5 +180,7 @@ def analyze_fixture(fixture: str, api_key: str):
             "maxEV": max_ev,
         })
 
-  return {"players": players_result}
-          
+  final_response = {"players": players_result}
+  cache_store[fixture] = (final_response, now)
+  return final_response
+    
