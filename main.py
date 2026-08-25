@@ -668,3 +668,62 @@ def get_kpis():
 
         "losses": losses
     }
+
+
+# ============================================================
+# PLAYER MARKET SCANNER V1.2
+# Endpoint inicial del motor de mercados de jugadores
+# ============================================================
+
+@app.get("/api/player-market")
+def player_market():
+    """
+    Devuelve la estructura inicial que utilizará
+    el Player Market Scanner de Fútbol Analytics.
+    
+    Esta V1.2 sirve para conectar el frontend
+    con el motor analítico.
+    """
+
+    jugador = "Jugador de prueba"
+    mercado = "Remates"
+    linea = 2.5
+
+    # Valores iniciales del motor.
+    # Posteriormente serán calculados con estadísticas reales.
+    fa_rating = 82
+    probabilidad = 68
+    cuota = 1.85
+
+    # Probabilidad implícita de la cuota
+    probabilidad_implicita = round((1 / cuota) * 100, 2)
+
+    # Value Edge
+    value_edge = round(
+        probabilidad - probabilidad_implicita,
+        2
+    )
+
+    # Clasificación de la oportunidad
+    if value_edge >= 15:
+        senal = "OPORTUNIDAD ALTA"
+    elif value_edge >= 8:
+        senal = "OPORTUNIDAD MEDIA"
+    elif value_edge > 0:
+        senal = "VALOR BAJO"
+    else:
+        senal = "SIN VALOR"
+
+    return {
+        "jugador": jugador,
+        "mercado": mercado,
+        "linea": linea,
+        "fa_rating": fa_rating,
+        "probabilidad": probabilidad,
+        "cuota": cuota,
+        "probabilidad_implicita": probabilidad_implicita,
+        "value_edge": value_edge,
+        "senal": senal,
+        "motor": "Fútbol Analytics V1.2",
+        "tipo": "demo"
+    }
