@@ -9,12 +9,12 @@ from pydantic import BaseModel
 
 
 # ============================================================
-# FÚTBOL ANALYTICS - BACKEND V1.4
+# FÚTBOL ANALYTICS - BACKEND V1.5
 # ============================================================
 
 app = FastAPI(
     title="Fútbol Analytics API",
-    version="1.4.0",
+    version="1.5.0",
     description=(
         "Motor de análisis estadístico, Player Market Scanner, "
         "API-Football, Value Edge y gestión de bankroll."
@@ -332,7 +332,7 @@ async def apifootball_get(
 
 
 # ============================================================
-# NORMALIZADORES DE ESTADÍSTICAS
+# NORMALIZADORES
 # ============================================================
 
 def safe_number(value):
@@ -348,6 +348,7 @@ def safe_number(value):
 
     try:
         return float(value)
+
     except Exception:
         return 0
 
@@ -510,6 +511,240 @@ def normalizar_player_statistics(
 
 
 # ============================================================
+# NORMALIZADOR DE ALINEACIONES
+# ============================================================
+
+def normalizar_lineup_player(
+    player_block: dict,
+    team_info: dict,
+    starter: bool = False
+) -> dict:
+
+    player = player_block.get(
+        "player",
+        {}
+    )
+
+    return {
+
+        "player_id":
+            player.get("id"),
+
+        "player":
+            player.get("name"),
+
+        "photo":
+            player.get("photo"),
+
+        "team":
+            team_info.get("name"),
+
+        "team_id":
+            team_info.get("id"),
+
+        "number":
+            player.get("number"),
+
+        "position":
+            player.get("pos"),
+
+        "grid":
+            player.get("grid"),
+
+        "starter":
+            starter,
+
+        "confirmed_lineup":
+            True
+    }
+
+
+# ============================================================
+# OBTENER ALINEACIONES
+# ============================================================
+
+async def obtener_lineups(
+    fixture_id: int
+):
+
+    result = await apifootball_get(
+        "/fixtures/lineups",
+        {
+            "fixture": fixture_id
+        }
+    )
+
+    if not result["ok"]:
+
+        return {
+            "ok": False,
+            "lineups": [],
+            "error": result["error"],
+            "data": result["data"]
+        }
+
+    lineups = []
+
+    for team_block in result[
+        "data"
+    ].get(
+        "response",
+        []
+    ):
+
+        team_info = team_block.get(
+            "team",
+            {}
+        )
+
+        # ----------------------------------------------------
+        # TITULARES
+        # ----------------------------------------------------
+
+        for player_block in team_block.get(
+            "startXI",
+            []
+        ):
+
+            player = normalizar_lineup_player(
+                player_block,
+                team_info,
+                starter=True
+            )
+
+            lineups.append(
+                player
+            )
+
+        # ----------------------------------------------------
+        # SUPLENTES
+        # ----------------------------------------------------
+
+        for player_block in team_block.get(
+            "substitutes",
+            []
+        ):
+
+            player = normalizar_lineup_player(
+                player_block,
+                team_info,
+                starter=False
+            )
+
+            lineups.append(
+                player
+            )
+
+    return {
+        "ok": True,
+        "lineups": lineups,
+        "error": None,
+        "data": result["data"]
+    }
+
+
+# ============================================================
+# ESTADÍSTICAS DE EQUIPO
+# ============================================================
+
+async def obtener_estadisticas_equipo(
+    team_id: int,
+    season: int = CURRENT_SEASON
+):
+
+    if not team_id:
+
+        return {
+            "ok": False,
+            "players": [],
+            "error": "team_id no válido"
+        }
+
+    result = await apifootball_get(
+        "/players",
+        {
+            "team": team_id,
+            "season": season,
+            "page": 1
+        }
+    )
+
+    if not result["ok"]:
+
+        return {
+            "ok": False,
+            "players": [],
+            "error": result["error"]
+        }
+
+    players = []
+
+    data = result["data"]
+
+    for item in data.get(
+        "response",
+        []
+    ):
+
+        normalized = normalizar_player_statistics(
+            item
+        )
+
+        players.append(
+            normalized
+        )
+
+    return {
+        "ok": True,
+        "players": players,
+        "error": None
+    }
+
+
+# ============================================================
+# OBTENER ESTADÍSTICAS DIRECTAS DE UN JUGADOR
+# ============================================================
+
+async def obtener_estadisticas_jugador(
+    player_id: int,
+    season: int = CURRENT_SEASON
+):
+
+    if not player_id:
+
+        return None
+
+    result = await apifootball_get(
+        "/players",
+        {
+            "id": player_id,
+            "season": season
+        }
+    )
+
+    if not result["ok"]:
+
+        return None
+
+    response = result[
+        "data"
+    ].get(
+        "response",
+        []
+    )
+
+    if not response:
+
+        return None
+
+    normalized = normalizar_player_statistics(
+        response[0]
+    )
+
+    return normalized
+
+
+# ============================================================
 # MODELOS
 # ============================================================
 
@@ -569,19 +804,16 @@ def read_root():
 
         "project": "Fútbol Analytics",
 
-        "version": "1.4.0",
+        "version": "1.5.0",
 
-        "engine": (
-            "Player Market Scanner V1.4"
-        ),
+        "engine":
+            "Player Market Scanner V1.5",
 
-        "api_football": bool(
-            APIFOOTBALL_KEY
-        ),
+        "api_football":
+            bool(APIFOOTBALL_KEY),
 
-        "message": (
+        "message":
             "Fútbol Analytics API corriendo"
-        )
     }
 
 
@@ -596,15 +828,14 @@ def health():
 
         "status": "healthy",
 
-        "service": (
-            "futbol-analytics-backend"
-        ),
+        "service":
+            "futbol-analytics-backend",
 
-        "version": "1.4.0",
+        "version":
+            "1.5.0",
 
-        "api_football_configured": bool(
-            APIFOOTBALL_KEY
-        )
+        "api_football_configured":
+            bool(APIFOOTBALL_KEY)
     }
 
 
@@ -625,32 +856,29 @@ async def test_apifootball():
 
             "status": "error",
 
-            "api_configured": bool(
-                APIFOOTBALL_KEY
-            ),
+            "api_configured":
+                bool(APIFOOTBALL_KEY),
 
-            "status_code": result[
-                "status_code"
-            ],
+            "status_code":
+                result["status_code"],
 
-            "message": result[
-                "error"
-            ]
+            "message":
+                result["error"]
         }
 
     return {
 
-        "status": "connected",
+        "status":
+            "connected",
 
-        "api_configured": True,
+        "api_configured":
+            True,
 
-        "status_code": result[
-            "status_code"
-        ],
+        "status_code":
+            result["status_code"],
 
-        "api_response": result[
-            "data"
-        ]
+        "api_response":
+            result["data"]
     }
 
 
@@ -720,9 +948,8 @@ async def get_matches(
             if response.status_code != 200:
 
                 try:
-                    details = (
-                        response.json()
-                    )
+                    details = response.json()
+
                 except Exception:
                     details = response.text
 
@@ -737,7 +964,8 @@ async def get_matches(
                         f"({response.status_code})"
                     ),
 
-                    "details": details
+                    "details":
+                        details
                 }
 
             data = response.json()
@@ -778,52 +1006,44 @@ async def get_matches(
 
                 processed_matches.append({
 
-                    "id": match.get(
-                        "id"
-                    ),
+                    "id":
+                        match.get("id"),
 
-                    "utcDate": match.get(
-                        "utcDate"
-                    ),
+                    "utcDate":
+                        match.get("utcDate"),
 
-                    "status": match.get(
-                        "status"
-                    ),
+                    "status":
+                        match.get("status"),
 
                     "competition": {
 
-                        "name": competition.get(
-                            "name"
-                        ),
+                        "name":
+                            competition.get("name"),
 
-                        "emblem": competition.get(
-                            "emblem"
-                        )
+                        "emblem":
+                            competition.get("emblem")
                     },
 
                     "homeTeam": {
 
-                        "name": home_team.get(
-                            "name"
-                        ),
+                        "name":
+                            home_team.get("name"),
 
-                        "crest": home_team.get(
-                            "crest"
-                        )
+                        "crest":
+                            home_team.get("crest")
                     },
 
                     "awayTeam": {
 
-                        "name": away_team.get(
-                            "name"
-                        ),
+                        "name":
+                            away_team.get("name"),
 
-                        "crest": away_team.get(
-                            "crest"
-                        )
+                        "crest":
+                            away_team.get("crest")
                     },
 
-                    "score": full_time,
+                    "score":
+                        full_time,
 
                     "ivjIndex":
                         calcular_indice_ivj(
@@ -833,13 +1053,14 @@ async def get_matches(
 
             return {
 
-                "count": len(
-                    processed_matches
-                ),
+                "count":
+                    len(processed_matches),
 
-                "dateFrom": date_from,
+                "dateFrom":
+                    date_from,
 
-                "dateTo": date_to,
+                "dateTo":
+                    date_to,
 
                 "matches":
                     processed_matches
@@ -853,11 +1074,11 @@ async def get_matches(
 
             "matches": [],
 
-            "error": (
-                "Error procesando partidos"
-            ),
+            "error":
+                "Error procesando partidos",
 
-            "details": str(exc)
+            "details":
+                str(exc)
         }
 
 
@@ -918,19 +1139,20 @@ async def apifootball_fixtures(
 
         return {
 
-            "status": "error",
+            "status":
+                "error",
 
-            "count": 0,
+            "count":
+                0,
 
-            "fixtures": [],
+            "fixtures":
+                [],
 
-            "message": result[
-                "error"
-            ],
+            "message":
+                result["error"],
 
-            "details": result[
-                "data"
-            ]
+            "details":
+                result["data"]
         }
 
     data = result["data"]
@@ -960,14 +1182,10 @@ async def apifootball_fixtures(
         fixtures.append({
 
             "fixture_id":
-                fixture_info.get(
-                    "id"
-                ),
+                fixture_info.get("id"),
 
             "date":
-                fixture_info.get(
-                    "date"
-                ),
+                fixture_info.get("date"),
 
             "status":
                 fixture_info.get(
@@ -978,19 +1196,13 @@ async def apifootball_fixtures(
             "league": {
 
                 "id":
-                    league_info.get(
-                        "id"
-                    ),
+                    league_info.get("id"),
 
                 "name":
-                    league_info.get(
-                        "name"
-                    ),
+                    league_info.get("name"),
 
                 "country":
-                    league_info.get(
-                        "country"
-                    )
+                    league_info.get("country")
             },
 
             "home": {
@@ -999,25 +1211,19 @@ async def apifootball_fixtures(
                     teams.get(
                         "home",
                         {}
-                    ).get(
-                        "id"
-                    ),
+                    ).get("id"),
 
                 "name":
                     teams.get(
                         "home",
                         {}
-                    ).get(
-                        "name"
-                    ),
+                    ).get("name"),
 
                 "logo":
                     teams.get(
                         "home",
                         {}
-                    ).get(
-                        "logo"
-                    )
+                    ).get("logo")
             },
 
             "away": {
@@ -1026,46 +1232,43 @@ async def apifootball_fixtures(
                     teams.get(
                         "away",
                         {}
-                    ).get(
-                        "id"
-                    ),
+                    ).get("id"),
 
                 "name":
                     teams.get(
                         "away",
                         {}
-                    ).get(
-                        "name"
-                    ),
+                    ).get("name"),
 
                 "logo":
                     teams.get(
                         "away",
                         {}
-                    ).get(
-                        "logo"
-                    )
+                    ).get("logo")
             }
         })
 
     return {
 
-        "status": "ok",
+        "status":
+            "ok",
 
-        "count": len(
-            fixtures
-        ),
+        "count":
+            len(fixtures),
 
-        "fixtures": fixtures,
+        "fixtures":
+            fixtures,
 
-        "source": "API-Football",
+        "source":
+            "API-Football",
 
-        "season": season
+        "season":
+            season
     }
 
 
 # ============================================================
-# API-FOOTBALL - JUGADORES DE UN FIXTURE
+# API-FOOTBALL - JUGADORES DE FIXTURE
 # ============================================================
 
 @app.get("/api/fixture-players")
@@ -1084,19 +1287,20 @@ async def fixture_players(
 
         return {
 
-            "status": "error",
+            "status":
+                "error",
 
-            "fixture_id": fixture_id,
+            "fixture_id":
+                fixture_id,
 
-            "players": [],
+            "players":
+                [],
 
-            "message": result[
-                "error"
-            ],
+            "message":
+                result["error"],
 
-            "details": result[
-                "data"
-            ]
+            "details":
+                result["data"]
         }
 
     data = result["data"]
@@ -1126,16 +1330,12 @@ async def fixture_players(
                 )
             )
 
-            normalized[
-                "team"
-            ] = team_info.get(
-                "name"
+            normalized["team"] = (
+                team_info.get("name")
             )
 
-            normalized[
-                "team_id"
-            ] = team_info.get(
-                "id"
+            normalized["team_id"] = (
+                team_info.get("id")
             )
 
             players.append(
@@ -1144,17 +1344,99 @@ async def fixture_players(
 
     return {
 
-        "status": "ok",
+        "status":
+            "ok",
 
-        "fixture_id": fixture_id,
+        "fixture_id":
+            fixture_id,
 
-        "count": len(
-            players
-        ),
+        "count":
+            len(players),
 
-        "players": players,
+        "players":
+            players,
 
-        "source": "API-Football"
+        "source":
+            "API-Football"
+    }
+
+
+# ============================================================
+# API-FOOTBALL - ALINEACIONES
+# ============================================================
+
+@app.get("/api/fixture-lineups")
+async def fixture_lineups(
+    fixture_id: int
+):
+
+    result = await obtener_lineups(
+        fixture_id
+    )
+
+    if not result["ok"]:
+
+        return {
+
+            "status":
+                "error",
+
+            "available":
+                False,
+
+            "fixture_id":
+                fixture_id,
+
+            "players":
+                [],
+
+            "message":
+                result["error"]
+        }
+
+    starters = [
+        player
+        for player in result["lineups"]
+        if player.get("starter")
+    ]
+
+    substitutes = [
+        player
+        for player in result["lineups"]
+        if not player.get("starter")
+    ]
+
+    return {
+
+        "status":
+            "ok",
+
+        "available":
+            True,
+
+        "fixture_id":
+            fixture_id,
+
+        "count":
+            len(result["lineups"]),
+
+        "starters_count":
+            len(starters),
+
+        "substitutes_count":
+            len(substitutes),
+
+        "starters":
+            starters,
+
+        "substitutes":
+            substitutes,
+
+        "players":
+            result["lineups"],
+
+        "source":
+            "API-Football"
     }
 
 
@@ -1180,13 +1462,14 @@ async def player_search(
 
         return {
 
-            "status": "error",
+            "status":
+                "error",
 
-            "players": [],
+            "players":
+                [],
 
-            "message": result[
-                "error"
-            ]
+            "message":
+                result["error"]
         }
 
     players = []
@@ -1205,46 +1488,41 @@ async def player_search(
 
         players.append({
 
-            "id": player.get(
-                "id"
-            ),
+            "id":
+                player.get("id"),
 
-            "name": player.get(
-                "name"
-            ),
+            "name":
+                player.get("name"),
 
-            "firstname": player.get(
-                "firstname"
-            ),
+            "firstname":
+                player.get("firstname"),
 
-            "lastname": player.get(
-                "lastname"
-            ),
+            "lastname":
+                player.get("lastname"),
 
-            "age": player.get(
-                "age"
-            ),
+            "age":
+                player.get("age"),
 
-            "nationality": player.get(
-                "nationality"
-            ),
+            "nationality":
+                player.get("nationality"),
 
-            "photo": player.get(
-                "photo"
-            )
+            "photo":
+                player.get("photo")
         })
 
     return {
 
-        "status": "ok",
+        "status":
+            "ok",
 
-        "count": len(
-            players
-        ),
+        "count":
+            len(players),
 
-        "players": players,
+        "players":
+            players,
 
-        "source": "API-Football"
+        "source":
+            "API-Football"
     }
 
 
@@ -1261,8 +1539,11 @@ async def player_season(
     result = await apifootball_get(
         "/players",
         {
-            "id": player_id,
-            "season": season
+            "id":
+                player_id,
+
+            "season":
+                season
         }
     )
 
@@ -1270,15 +1551,17 @@ async def player_season(
 
         return {
 
-            "status": "error",
+            "status":
+                "error",
 
-            "player_id": player_id,
+            "player_id":
+                player_id,
 
-            "statistics": [],
+            "statistics":
+                [],
 
-            "message": result[
-                "error"
-            ]
+            "message":
+                result["error"]
         }
 
     response = result[
@@ -1292,16 +1575,17 @@ async def player_season(
 
         return {
 
-            "status": "no_data",
+            "status":
+                "no_data",
 
-            "player_id": player_id,
+            "player_id":
+                player_id,
 
-            "statistics": [],
+            "statistics":
+                [],
 
-            "message": (
-                "No existen estadísticas "
-                "para este jugador."
-            )
+            "message":
+                "No existen estadísticas para este jugador."
         }
 
     player = response[0].get(
@@ -1318,71 +1602,80 @@ async def player_season(
 
         statistics.append({
 
-            "team": item.get(
-                "team",
-                {}
-            ),
+            "team":
+                item.get(
+                    "team",
+                    {}
+                ),
 
-            "league": item.get(
-                "league",
-                {}
-            ),
+            "league":
+                item.get(
+                    "league",
+                    {}
+                ),
 
-            "games": item.get(
-                "games",
-                {}
-            ),
+            "games":
+                item.get(
+                    "games",
+                    {}
+                ),
 
-            "shots": item.get(
-                "shots",
-                {}
-            ),
+            "shots":
+                item.get(
+                    "shots",
+                    {}
+                ),
 
-            "goals": item.get(
-                "goals",
-                {}
-            ),
+            "goals":
+                item.get(
+                    "goals",
+                    {}
+                ),
 
-            "passes": item.get(
-                "passes",
-                {}
-            ),
+            "passes":
+                item.get(
+                    "passes",
+                    {}
+                ),
 
-            "fouls": item.get(
-                "fouls",
-                {}
-            ),
+            "fouls":
+                item.get(
+                    "fouls",
+                    {}
+                ),
 
-            "cards": item.get(
-                "cards",
-                {}
-            )
+            "cards":
+                item.get(
+                    "cards",
+                    {}
+                )
         })
 
     return {
 
-        "status": "ok",
+        "status":
+            "ok",
 
         "player": {
 
-            "id": player.get(
-                "id"
-            ),
+            "id":
+                player.get("id"),
 
-            "name": player.get(
-                "name"
-            ),
+            "name":
+                player.get("name"),
 
-            "photo": player.get(
-                "photo"
-            )
+            "photo":
+                player.get("photo")
         },
 
-        "season": season,
+        "season":
+            season,
 
-        "statistics": statistics,
+        "statistics":
+            statistics,
 
-        "source": "API-Football"
+        "source":
+            "API-Football"
     }
 
 
@@ -1420,9 +1713,17 @@ def scanner(
         fa_rating
     )
 
+    stake_percent = max(
+        MIN_STAKE_PERCENT,
+        min(
+            request.stake_percent,
+            MAX_STAKE_PERCENT
+        )
+    )
+
     stake = calcular_stake(
         request.bankroll,
-        request.stake_percent
+        stake_percent
     )
 
     signal = determinar_senal(
@@ -1469,13 +1770,7 @@ def scanner(
             signal,
 
         "stake_percent":
-            min(
-                max(
-                    request.stake_percent,
-                    MIN_STAKE_PERCENT
-                ),
-                MAX_STAKE_PERCENT
-            ),
+            stake_percent,
 
         "recommended_stake":
             stake,
@@ -1490,12 +1785,12 @@ def scanner(
         ),
 
         "motor":
-            "Fútbol Analytics V1.4"
+            "Fútbol Analytics V1.5"
     }
 
 
 # ============================================================
-# PLAYER MARKET - ESTADO
+# PLAYER MARKET - PRE-PARTIDO
 # ============================================================
 
 @app.get("/api/player-market")
@@ -1503,26 +1798,38 @@ async def player_market(
     fixture_id: Optional[int] = None
 ):
 
+    # --------------------------------------------------------
+    # 1. COMPROBAR API
+    # --------------------------------------------------------
+
     if not APIFOOTBALL_KEY:
 
         return {
 
-            "status": "waiting_api",
+            "status":
+                "waiting_api",
 
-            "available": False,
+            "available":
+                False,
 
-            "senal": "SIN DATOS",
+            "senal":
+                "SIN DATOS",
 
-            "signal": "SIN DATOS",
+            "signal":
+                "SIN DATOS",
 
             "motor":
-                "Fútbol Analytics V1.4",
+                "Fútbol Analytics V1.5",
 
             "message": (
                 "Configura APIFOOTBALL_KEY "
                 "en Render."
             )
         }
+
+    # --------------------------------------------------------
+    # 2. BUSCAR FIXTURE
+    # --------------------------------------------------------
 
     if fixture_id is None:
 
@@ -1544,14 +1851,14 @@ async def player_market(
 
             return {
 
-                "status": "error",
+                "status":
+                    "error",
 
-                "available": False,
+                "available":
+                    False,
 
                 "message":
-                    fixture_result[
-                        "error"
-                    ]
+                    fixture_result["error"]
             }
 
         fixtures = (
@@ -1593,7 +1900,8 @@ async def player_market(
                 "status":
                     "waiting_fixture",
 
-                "available": False,
+                "available":
+                    False,
 
                 "senal":
                     "SIN DATOS",
@@ -1602,7 +1910,7 @@ async def player_market(
                     "SIN DATOS",
 
                 "motor":
-                    "Fútbol Analytics V1.4",
+                    "Fútbol Analytics V1.5",
 
                 "message": (
                     "No hay un fixture "
@@ -1621,108 +1929,100 @@ async def player_market(
             )
         )
 
-    player_result = (
-        await apifootball_get(
-            "/fixtures/players",
-            {
-                "fixture":
-                    fixture_id
-            }
-        )
+    # --------------------------------------------------------
+    # 3. OBTENER FIXTURE
+    # --------------------------------------------------------
+
+    fixture_result = await apifootball_get(
+        "/fixtures",
+        {
+            "id":
+                fixture_id
+        }
     )
 
-    if not player_result["ok"]:
+    if not fixture_result["ok"]:
 
         return {
 
             "status":
-                "fixture_data_pending",
+                "fixture_error",
 
-            "available": False,
+            "available":
+                False,
 
             "fixture_id":
                 fixture_id,
 
-            "senal":
-                "SIN DATOS",
-
-            "signal":
-                "SIN DATOS",
-
-            "motor":
-                "Fútbol Analytics V1.4",
-
-            "message": (
-                "El fixture existe, "
-                "pero las estadísticas "
-                "de jugadores todavía "
-                "no están disponibles."
-            ),
-
-            "details":
-                player_result[
-                    "data"
-                ]
+            "message":
+                fixture_result["error"]
         }
 
-    players = []
-
-    for team_block in (
-        player_result[
-            "data"
-        ].get(
+    fixture_response = (
+        fixture_result["data"]
+        .get(
             "response",
             []
         )
-    ):
+    )
 
-        team_info = team_block.get(
-            "team",
-            {}
-        )
+    if not fixture_response:
 
-        for player_block in (
-            team_block.get(
-                "players",
-                []
-            )
-        ):
+        return {
 
-            normalized = (
-                normalizar_player_statistics(
-                    player_block
-                )
-            )
+            "status":
+                "fixture_not_found",
 
-            normalized[
-                "team"
-            ] = team_info.get(
-                "name"
-            )
+            "available":
+                False,
 
-            normalized[
-                "team_id"
-            ] = team_info.get(
-                "id"
-            )
+            "fixture_id":
+                fixture_id,
 
-            players.append(
-                normalized
-            )
+            "message":
+                "No se encontró el fixture."
+        }
 
-    if not players:
+    fixture_data = fixture_response[0]
+
+    teams = fixture_data.get(
+        "teams",
+        {}
+    )
+
+    home_team = teams.get(
+        "home",
+        {}
+    )
+
+    away_team = teams.get(
+        "away",
+        {}
+    )
+
+    # --------------------------------------------------------
+    # 4. OBTENER ALINEACIONES
+    # --------------------------------------------------------
+
+    lineup_result = await obtener_lineups(
+        fixture_id
+    )
+
+    if not lineup_result["ok"]:
 
         return {
 
             "status":
                 "lineups_pending",
 
-            "available": False,
+            "available":
+                False,
 
             "fixture_id":
                 fixture_id,
 
-            "players": [],
+            "players":
+                [],
 
             "senal":
                 "SIN DATOS",
@@ -1731,27 +2031,274 @@ async def player_market(
                 "SIN DATOS",
 
             "motor":
-                "Fútbol Analytics V1.4",
+                "Fútbol Analytics V1.5",
 
             "message": (
-                "Todavía no existen "
-                "estadísticas individuales "
-                "para este fixture."
+                "Las alineaciones todavía "
+                "no están disponibles."
+            ),
+
+            "details":
+                lineup_result["error"]
+        }
+
+    lineups = lineup_result[
+        "lineups"
+    ]
+
+    if not lineups:
+
+        return {
+
+            "status":
+                "lineups_pending",
+
+            "available":
+                False,
+
+            "fixture_id":
+                fixture_id,
+
+            "players":
+                [],
+
+            "senal":
+                "SIN DATOS",
+
+            "signal":
+                "SIN DATOS",
+
+            "motor":
+                "Fútbol Analytics V1.5",
+
+            "message": (
+                "Las alineaciones todavía "
+                "no han sido publicadas."
             )
         }
+
+    # --------------------------------------------------------
+    # 5. OBTENER ESTADÍSTICAS DE LOS EQUIPOS
+    # --------------------------------------------------------
+
+    home_stats_result = (
+        await obtener_estadisticas_equipo(
+            home_team.get("id"),
+            CURRENT_SEASON
+        )
+    )
+
+    away_stats_result = (
+        await obtener_estadisticas_equipo(
+            away_team.get("id"),
+            CURRENT_SEASON
+        )
+    )
+
+    season_players = []
+
+    if home_stats_result["ok"]:
+
+        season_players.extend(
+            home_stats_result["players"]
+        )
+
+    if away_stats_result["ok"]:
+
+        season_players.extend(
+            away_stats_result["players"]
+        )
+
+    # --------------------------------------------------------
+    # 6. ÍNDICE DE ESTADÍSTICAS
+    # --------------------------------------------------------
+
+    stats_by_player = {}
+
+    for player in season_players:
+
+        player_id = player.get(
+            "player_id"
+        )
+
+        if player_id:
+
+            stats_by_player[
+                player_id
+            ] = player
+
+    # --------------------------------------------------------
+    # 7. CRUZAR ALINEACIONES Y ESTADÍSTICAS
+    # --------------------------------------------------------
+
+    players = []
+
+    for lineup_player in lineups:
+
+        player_id = lineup_player.get(
+            "player_id"
+        )
+
+        stats = stats_by_player.get(
+            player_id
+        )
+
+        # ----------------------------------------------------
+        # Si el jugador no apareció en la primera página
+        # del equipo, intentamos consulta directa.
+        # ----------------------------------------------------
+
+        if not stats:
+
+            stats = await obtener_estadisticas_jugador(
+                player_id,
+                CURRENT_SEASON
+            )
+
+        if not stats:
+
+            stats = {}
+
+        merged = {
+            **stats,
+            **lineup_player
+        }
+
+        merged["player_id"] = (
+            player_id
+        )
+
+        merged["confirmed_lineup"] = (
+            True
+        )
+
+        merged["starter"] = (
+            lineup_player.get(
+                "starter",
+                False
+            )
+        )
+
+        merged["fixture_id"] = (
+            fixture_id
+        )
+
+        merged["data_source"] = (
+            "API-Football"
+        )
+
+        merged["season"] = (
+            CURRENT_SEASON
+        )
+
+        players.append(
+            merged
+        )
+
+    # --------------------------------------------------------
+    # 8. TITULARES
+    # --------------------------------------------------------
+
+    starters = [
+        player
+        for player in players
+        if player.get("starter")
+    ]
+
+    # --------------------------------------------------------
+    # 9. SUPLENTES
+    # --------------------------------------------------------
+
+    substitutes = [
+        player
+        for player in players
+        if not player.get("starter")
+    ]
+
+    # --------------------------------------------------------
+    # 10. ESTADO DE DATOS
+    # --------------------------------------------------------
+
+    players_with_stats = [
+        player
+        for player in players
+        if player.get("shots") is not None
+    ]
+
+    # --------------------------------------------------------
+    # 11. RESPUESTA
+    # --------------------------------------------------------
 
     return {
 
         "status":
             "real_player_data",
 
-        "available": True,
+        "available":
+            True,
 
         "fixture_id":
             fixture_id,
 
+        "fixture": {
+
+            "date":
+                fixture_data.get(
+                    "fixture",
+                    {}
+                ).get(
+                    "date"
+                ),
+
+            "status":
+                fixture_data.get(
+                    "fixture",
+                    {}
+                ).get(
+                    "status",
+                    {}
+                ),
+
+            "league":
+                fixture_data.get(
+                    "league",
+                    {}
+                ).get(
+                    "name"
+                ),
+
+            "country":
+                fixture_data.get(
+                    "league",
+                    {}
+                ).get(
+                    "country"
+                ),
+
+            "home":
+                home_team,
+
+            "away":
+                away_team
+        },
+
         "count":
             len(players),
+
+        "starters_count":
+            len(starters),
+
+        "substitutes_count":
+            len(substitutes),
+
+        "players_with_stats":
+            len(players_with_stats),
+
+        "starters":
+            starters,
+
+        "substitutes":
+            substitutes,
 
         "players":
             players,
@@ -1766,17 +2313,18 @@ async def player_market(
             "DATOS REALES",
 
         "motor":
-            "Fútbol Analytics V1.4",
+            "Fútbol Analytics V1.5",
 
         "message": (
-            "Estadísticas reales "
-            "recibidas desde API-Football."
+            "Alineaciones confirmadas y "
+            "estadísticas de temporada "
+            "obtenidas desde API-Football."
         )
     }
 
 
 # ============================================================
-# PLAYER MARKETS - MULTIPLES
+# PLAYER MARKETS - MÚLTIPLES
 # ============================================================
 
 @app.get("/api/player-markets")
@@ -1801,13 +2349,17 @@ async def player_markets(
                     "waiting_data"
                 ),
 
-            "available": False,
+            "available":
+                False,
 
-            "count": 0,
+            "count":
+                0,
 
-            "markets": [],
+            "markets":
+                [],
 
-            "players": [],
+            "players":
+                [],
 
             "message":
                 result.get(
@@ -1816,7 +2368,7 @@ async def player_markets(
                 ),
 
             "motor":
-                "Fútbol Analytics V1.4"
+                "Fútbol Analytics V1.5"
         }
 
     return {
@@ -1824,11 +2376,18 @@ async def player_markets(
         "status":
             "real_player_data",
 
-        "available": True,
+        "available":
+            True,
 
         "count":
             result.get(
                 "count",
+                0
+            ),
+
+        "starters_count":
+            result.get(
+                "starters_count",
                 0
             ),
 
@@ -1838,6 +2397,18 @@ async def player_markets(
         "players":
             result.get(
                 "players",
+                []
+            ),
+
+        "starters":
+            result.get(
+                "starters",
+                []
+            ),
+
+        "substitutes":
+            result.get(
+                "substitutes",
                 []
             ),
 
@@ -1854,7 +2425,7 @@ async def player_markets(
         ),
 
         "motor":
-            "Fútbol Analytics V1.4"
+            "Fútbol Analytics V1.5"
     }
 
 
