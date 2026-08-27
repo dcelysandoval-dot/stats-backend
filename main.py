@@ -9,13 +9,16 @@ from pydantic import BaseModel
 
 
 # ============================================================
-# FÚTBOL ANALYTICS - BACKEND V1.1
+# FÚTBOL ANALYTICS - BACKEND V1.3
 # ============================================================
 
 app = FastAPI(
     title="Fútbol Analytics API",
-    version="1.1.0",
-    description="Motor inicial de análisis estadístico, Value Edge y gestión de bankroll."
+    version="1.3.0",
+    description=(
+        "Motor de análisis estadístico, Player Market Scanner, "
+        "Value Edge y gestión de bankroll."
+    )
 )
 
 
@@ -61,11 +64,19 @@ MAX_STAKE_PERCENT = 3.0
 
 def calcular_indice_ivj(match: dict) -> float:
     """
-    Mantiene el IVJ original del proyecto.
+    IVJ inicial del proyecto.
 
-    Esta versión inicial utiliza el marcador del partido.
-    Posteriormente lo reemplazaremos por variables reales
-    de jugadores y mercados estadísticos.
+    Actualmente utiliza los goles del partido.
+    En futuras versiones podrá incorporar:
+    - volumen ofensivo
+    - tiros
+    - tiros a puerta
+    - posesión
+    - xG
+    - ritmo
+    - tarjetas
+    - faltas
+    - rendimiento de jugadores
     """
 
     score = match.get("score", {}).get("fullTime", {})
@@ -80,11 +91,10 @@ def calcular_indice_ivj(match: dict) -> float:
 
 def probabilidad_implicita(cuota: float) -> float:
     """
-    Convierte una cuota decimal en probabilidad implícita.
+    Convierte cuota decimal en probabilidad implícita.
 
-    Ejemplo:
-    cuota 2.00 = 50%
-    cuota 1.50 = 66.67%
+    2.00 = 50%
+    1.50 = 66.67%
     """
 
     if cuota <= 1:
@@ -98,8 +108,8 @@ def calcular_value_edge(
     cuota: float
 ) -> float:
     """
-    Value Edge = Probabilidad estimada por Fútbol Analytics
-                  - Probabilidad implícita de la cuota.
+    Value Edge =
+    Probabilidad FA - Probabilidad implícita de cuota.
     """
 
     probabilidad_cuota = probabilidad_implicita(cuota)
@@ -116,10 +126,7 @@ def calcular_fa_rating(
     confianza: float = 70
 ) -> int:
     """
-    FA Rating inicial de 0 a 100.
-
-    No representa una garantía de resultado.
-    Es un índice interno de calidad de oportunidad.
+    FA Rating interno de 0 a 100.
     """
 
     score = (
@@ -138,9 +145,9 @@ def calcular_stake(
     stake_percent: float
 ) -> float:
     """
-    Calcula el dinero recomendado según bankroll.
+    Calcula stake recomendado.
 
-    El sistema limita automáticamente el stake
+    El sistema limita automáticamente
     entre 1% y 3%.
     """
 
@@ -167,6 +174,23 @@ def determinar_riesgo(fa_rating: int) -> str:
         return "MODERADO"
 
     return "ALTO"
+
+
+def determinar_senal(value_edge: float) -> str:
+    """
+    Clasificación interna del motor.
+    """
+
+    if value_edge >= 15:
+        return "OPORTUNIDAD ALTA"
+
+    if value_edge >= 8:
+        return "OPORTUNIDAD MEDIA"
+
+    if value_edge > 0:
+        return "VALOR BAJO"
+
+    return "SIN VALOR"
 
 
 # ============================================================
@@ -229,7 +253,8 @@ def read_root():
     return {
         "status": "ok",
         "project": "Fútbol Analytics",
-        "version": "1.1.0",
+        "version": "1.3.0",
+        "engine": "Player Market Scanner V1.3",
         "message": "Fútbol Analytics API corriendo"
     }
 
@@ -243,7 +268,8 @@ def health():
 
     return {
         "status": "healthy",
-        "service": "futbol-analytics-backend"
+        "service": "futbol-analytics-backend",
+        "version": "1.3.0"
     }
 
 
@@ -276,7 +302,7 @@ async def get_matches(days_ahead: int = 1):
     try:
 
         async with httpx.AsyncClient(
-            timeout=10.0
+            timeout=15.0
         ) as client:
 
             response = await client.get(
@@ -286,17 +312,19 @@ async def get_matches(days_ahead: int = 1):
 
             if response.status_code != 200:
 
+                try:
+                    details = response.json()
+                except Exception:
+                    details = response.text
+
                 return {
+                    "count": 0,
                     "matches": [],
                     "error": (
                         f"Error en API externa "
                         f"({response.status_code})"
                     ),
-                    "details": (
-                        response.json()
-                        if response.content
-                        else "Sin detalle"
-                    )
+                    "details": details
                 }
 
             data = response.json()
@@ -308,65 +336,81 @@ async def get_matches(days_ahead: int = 1):
 
             processed_matches = []
 
-            for m in raw_matches:
+            for match in raw_matches:
 
-                ivj_val = calcular_indice_ivj(m)
+                ivj_val = calcular_indice_ivj(
+                    match
+                )
+
+                competition = match.get(
+                    "competition",
+                    {}
+                )
+
+                home_team = match.get(
+                    "homeTeam",
+                    {}
+                )
+
+                away_team = match.get(
+                    "awayTeam",
+                    {}
+                )
+
+                full_time = match.get(
+                    "score",
+                    {}
+                ).get(
+                    "fullTime",
+                    {}
+                )
 
                 processed_matches.append({
 
-                    "id": m.get("id"),
+                    "id": match.get("id"),
 
-                    "utcDate": m.get(
+                    "utcDate": match.get(
                         "utcDate"
                     ),
 
-                    "status": m.get(
+                    "status": match.get(
                         "status"
                     ),
 
                     "competition": {
 
-                        "name": m.get(
-                            "competition",
-                            {}
-                        ).get("name"),
+                        "name": competition.get(
+                            "name"
+                        ),
 
-                        "emblem": m.get(
-                            "competition",
-                            {}
-                        ).get("emblem")
+                        "emblem": competition.get(
+                            "emblem"
+                        )
                     },
 
                     "homeTeam": {
 
-                        "name": m.get(
-                            "homeTeam",
-                            {}
-                        ).get("name"),
+                        "name": home_team.get(
+                            "name"
+                        ),
 
-                        "crest": m.get(
-                            "homeTeam",
-                            {}
-                        ).get("crest")
+                        "crest": home_team.get(
+                            "crest"
+                        )
                     },
 
                     "awayTeam": {
 
-                        "name": m.get(
-                            "awayTeam",
-                            {}
-                        ).get("name"),
+                        "name": away_team.get(
+                            "name"
+                        ),
 
-                        "crest": m.get(
-                            "awayTeam",
-                            {}
-                        ).get("crest")
+                        "crest": away_team.get(
+                            "crest"
+                        )
                     },
 
-                    "score": m.get(
-                        "score",
-                        {}
-                    ).get("fullTime"),
+                    "score": full_time,
 
                     "ivjIndex": ivj_val
                 })
@@ -388,6 +432,8 @@ async def get_matches(days_ahead: int = 1):
 
         return {
 
+            "count": 0,
+
             "matches": [],
 
             "error": (
@@ -398,15 +444,33 @@ async def get_matches(days_ahead: int = 1):
             "details": str(exc)
         }
 
+    except Exception as exc:
+
+        return {
+
+            "count": 0,
+
+            "matches": [],
+
+            "error": (
+                "Error interno procesando "
+                "los partidos"
+            ),
+
+            "details": str(exc)
+        }
+
 
 # ============================================================
-# COMPATIBILIDAD CON EL FRONTEND ACTUAL
+# COMPATIBILIDAD CON FRONTEND
 # ============================================================
 
 @app.get("/api/partidos-hoy")
 async def partidos_hoy():
 
-    return await get_matches(days_ahead=1)
+    return await get_matches(
+        days_ahead=1
+    )
 
 
 # ============================================================
@@ -416,8 +480,10 @@ async def partidos_hoy():
 @app.post("/api/scanner")
 def scanner(request: ScannerRequest):
 
-    implied_probability = probabilidad_implicita(
-        request.odds
+    implied_probability = (
+        probabilidad_implicita(
+            request.odds
+        )
     )
 
     value_edge = calcular_value_edge(
@@ -442,6 +508,10 @@ def scanner(request: ScannerRequest):
 
     value_positive = value_edge > 0
 
+    signal = determinar_senal(
+        value_edge
+    )
+
     return {
 
         "player": request.player,
@@ -464,6 +534,8 @@ def scanner(request: ScannerRequest):
 
         "risk": risk,
 
+        "signal": signal,
+
         "stake_percent": min(
             max(
                 request.stake_percent,
@@ -480,7 +552,124 @@ def scanner(request: ScannerRequest):
             "OPORTUNIDAD CON VALOR"
             if value_positive
             else "SIN VALOR POSITIVO"
+        ),
+
+        "motor": "Fútbol Analytics V1.3"
+    }
+
+
+# ============================================================
+# PLAYER MARKET - ESTADO DEL MOTOR
+# ============================================================
+
+@app.get("/api/player-market")
+def player_market():
+
+    """
+    Endpoint compatible con el frontend actual.
+
+    IMPORTANTE:
+    No inventa estadísticas.
+
+    Mientras no exista una fuente real de
+    estadísticas de jugadores, devuelve
+    estado SIN DATOS REALES.
+    """
+
+    return {
+
+        "status": "waiting_data",
+
+        "available": False,
+
+        "jugador": "Sin datos reales",
+
+        "player": "Sin datos reales",
+
+        "mercado": "Remates",
+
+        "market": "Remates",
+
+        "linea": None,
+
+        "line": None,
+
+        "fa_rating": None,
+
+        "faRating": None,
+
+        "probabilidad": None,
+
+        "probability_fa": None,
+
+        "cuota": None,
+
+        "odds": None,
+
+        "probabilidad_implicita": None,
+
+        "value_edge": None,
+
+        "valueEdge": None,
+
+        "senal": "SIN DATOS",
+
+        "signal": "SIN DATOS",
+
+        "motor": "Fútbol Analytics V1.3",
+
+        "tipo": "real_pending",
+
+        "message": (
+            "El motor está preparado para "
+            "recibir estadísticas reales de jugadores."
         )
+    }
+
+
+# ============================================================
+# PLAYER MARKETS - MULTIPLES OPORTUNIDADES
+# ============================================================
+
+@app.get("/api/player-markets")
+def player_markets():
+
+    """
+    Endpoint futuro para múltiples mercados.
+
+    Ejemplo futuro:
+
+    [
+        {
+            jugador: "...",
+            mercado: "Remates",
+            linea: 2.5,
+            probabilidad: 64,
+            cuota: 1.90,
+            value_edge: 11.37,
+            fa_rating: 78
+        }
+    ]
+
+    Por ahora NO se generan picks ficticios.
+    """
+
+    return {
+
+        "status": "waiting_data",
+
+        "available": False,
+
+        "count": 0,
+
+        "markets": [],
+
+        "message": (
+            "No existen todavía mercados de "
+            "jugadores con estadísticas reales."
+        ),
+
+        "motor": "Fútbol Analytics V1.3"
     }
 
 
@@ -607,6 +796,8 @@ def get_kpis():
 
     losses = 0
 
+    voids = 0
+
     for bet in settled_bets:
 
         stake = bet["stake"]
@@ -628,6 +819,10 @@ def get_kpis():
             profit -= stake
 
             losses += 1
+
+        elif result == "ANULADA":
+
+            voids += 1
 
     yield_percent = (
         (profit / total_staked) * 100
@@ -666,64 +861,7 @@ def get_kpis():
 
         "wins": wins,
 
-        "losses": losses
-    }
+        "losses": losses,
 
-
-# ============================================================
-# PLAYER MARKET SCANNER V1.2
-# Endpoint inicial del motor de mercados de jugadores
-# ============================================================
-
-@app.get("/api/player-market")
-def player_market():
-    """
-    Devuelve la estructura inicial que utilizará
-    el Player Market Scanner de Fútbol Analytics.
-    
-    Esta V1.2 sirve para conectar el frontend
-    con el motor analítico.
-    """
-
-    jugador = "Jugador de prueba"
-    mercado = "Remates"
-    linea = 2.5
-
-    # Valores iniciales del motor.
-    # Posteriormente serán calculados con estadísticas reales.
-    fa_rating = 82
-    probabilidad = 68
-    cuota = 1.85
-
-    # Probabilidad implícita de la cuota
-    probabilidad_implicita = round((1 / cuota) * 100, 2)
-
-    # Value Edge
-    value_edge = round(
-        probabilidad - probabilidad_implicita,
-        2
-    )
-
-    # Clasificación de la oportunidad
-    if value_edge >= 15:
-        senal = "OPORTUNIDAD ALTA"
-    elif value_edge >= 8:
-        senal = "OPORTUNIDAD MEDIA"
-    elif value_edge > 0:
-        senal = "VALOR BAJO"
-    else:
-        senal = "SIN VALOR"
-
-    return {
-        "jugador": jugador,
-        "mercado": mercado,
-        "linea": linea,
-        "fa_rating": fa_rating,
-        "probabilidad": probabilidad,
-        "cuota": cuota,
-        "probabilidad_implicita": probabilidad_implicita,
-        "value_edge": value_edge,
-        "senal": senal,
-        "motor": "Fútbol Analytics V1.2",
-        "tipo": "demo"
+        "voids": voids
     }
