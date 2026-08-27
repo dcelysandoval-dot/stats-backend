@@ -9,15 +9,15 @@ from pydantic import BaseModel
 
 
 # ============================================================
-# FÚTBOL ANALYTICS - BACKEND V1.3
+# FÚTBOL ANALYTICS - BACKEND V1.4
 # ============================================================
 
 app = FastAPI(
     title="Fútbol Analytics API",
-    version="1.3.0",
+    version="1.4.0",
     description=(
         "Motor de análisis estadístico, Player Market Scanner, "
-        "Value Edge y gestión de bankroll."
+        "API-Football, Value Edge y gestión de bankroll."
     )
 )
 
@@ -41,12 +41,40 @@ app.add_middleware(
 
 FOOTBALL_DATA_API_KEY = os.getenv(
     "FOOTBALL_DATA_API_KEY",
-    "TU_API_KEY_AQUI"
+    ""
 )
 
 BASE_URL = "https://api.football-data.org/v4"
 
 FREE_LEAGUES = "PL,PD,SA,BL1,FL1,CL,EC,WC"
+
+
+# ============================================================
+# CONFIGURACIÓN API-FOOTBALL / API-SPORTS
+# ============================================================
+
+APIFOOTBALL_KEY = os.getenv(
+    "APIFOOTBALL_KEY",
+    ""
+)
+
+APIFOOTBALL_URL = "https://v3.football.api-sports.io"
+
+
+# ============================================================
+# CONFIGURACIÓN GENERAL
+# ============================================================
+
+CURRENT_SEASON = 2026
+
+SUPPORTED_MARKETS = [
+    "Remates",
+    "Remates a puerta",
+    "Goles",
+    "Asistencias",
+    "Faltas",
+    "Tarjetas"
+]
 
 
 # ============================================================
@@ -59,60 +87,68 @@ MAX_STAKE_PERCENT = 3.0
 
 
 # ============================================================
+# MEMORIA TEMPORAL DE APUESTAS
+# ============================================================
+
+bets = []
+
+
+# ============================================================
 # FUNCIONES DEL MOTOR ANALÍTICO
 # ============================================================
 
 def calcular_indice_ivj(match: dict) -> float:
-    """
-    IVJ inicial del proyecto.
 
-    Actualmente utiliza los goles del partido.
-    En futuras versiones podrá incorporar:
-    - volumen ofensivo
-    - tiros
-    - tiros a puerta
-    - posesión
-    - xG
-    - ritmo
-    - tarjetas
-    - faltas
-    - rendimiento de jugadores
-    """
+    score = match.get(
+        "score",
+        {}
+    ).get(
+        "fullTime",
+        {}
+    )
 
-    score = match.get("score", {}).get("fullTime", {})
+    home_score = score.get(
+        "home",
+        0
+    ) or 0
 
-    home_score = score.get("home", 0) or 0
-    away_score = score.get("away", 0) or 0
+    away_score = score.get(
+        "away",
+        0
+    ) or 0
 
-    ivj_base = 5.0 + (home_score + away_score) * 0.5
+    ivj_base = (
+        5.0
+        + (home_score + away_score) * 0.5
+    )
 
-    return round(ivj_base, 2)
+    return round(
+        ivj_base,
+        2
+    )
 
 
-def probabilidad_implicita(cuota: float) -> float:
-    """
-    Convierte cuota decimal en probabilidad implícita.
-
-    2.00 = 50%
-    1.50 = 66.67%
-    """
+def probabilidad_implicita(
+    cuota: float
+) -> float:
 
     if cuota <= 1:
         return 0.0
 
-    return round((1 / cuota) * 100, 2)
+    return round(
+        (1 / cuota) * 100,
+        2
+    )
 
 
 def calcular_value_edge(
     probabilidad_fa: float,
     cuota: float
 ) -> float:
-    """
-    Value Edge =
-    Probabilidad FA - Probabilidad implícita de cuota.
-    """
 
-    probabilidad_cuota = probabilidad_implicita(cuota)
+    probabilidad_cuota = (
+        probabilidad_implicita(cuota)
+    )
 
     return round(
         probabilidad_fa - probabilidad_cuota,
@@ -125,9 +161,6 @@ def calcular_fa_rating(
     value_edge: float,
     confianza: float = 70
 ) -> int:
-    """
-    FA Rating interno de 0 a 100.
-    """
 
     score = (
         probabilidad_fa * 0.45
@@ -135,7 +168,10 @@ def calcular_fa_rating(
         + confianza * 0.25
     )
 
-    score = max(0, min(score, 100))
+    score = max(
+        0,
+        min(score, 100)
+    )
 
     return round(score)
 
@@ -144,25 +180,26 @@ def calcular_stake(
     bankroll: float,
     stake_percent: float
 ) -> float:
-    """
-    Calcula stake recomendado.
-
-    El sistema limita automáticamente
-    entre 1% y 3%.
-    """
 
     stake_percent = max(
         MIN_STAKE_PERCENT,
-        min(stake_percent, MAX_STAKE_PERCENT)
+        min(
+            stake_percent,
+            MAX_STAKE_PERCENT
+        )
     )
 
     return round(
-        bankroll * (stake_percent / 100),
+        bankroll * (
+            stake_percent / 100
+        ),
         2
     )
 
 
-def determinar_riesgo(fa_rating: int) -> str:
+def determinar_riesgo(
+    fa_rating: int
+) -> str:
 
     if fa_rating >= 80:
         return "BAJO"
@@ -176,10 +213,9 @@ def determinar_riesgo(fa_rating: int) -> str:
     return "ALTO"
 
 
-def determinar_senal(value_edge: float) -> str:
-    """
-    Clasificación interna del motor.
-    """
+def determinar_senal(
+    value_edge: float
+) -> str:
 
     if value_edge >= 15:
         return "OPORTUNIDAD ALTA"
@@ -194,6 +230,286 @@ def determinar_senal(value_edge: float) -> str:
 
 
 # ============================================================
+# FUNCIONES API-FOOTBALL
+# ============================================================
+
+async def apifootball_get(
+    endpoint: str,
+    params: Optional[dict] = None
+):
+
+    if not APIFOOTBALL_KEY:
+
+        return {
+            "ok": False,
+            "status_code": None,
+            "data": None,
+            "error": (
+                "APIFOOTBALL_KEY no está "
+                "configurada en Render."
+            )
+        }
+
+    headers = {
+        "x-apisports-key": APIFOOTBALL_KEY
+    }
+
+    url = (
+        APIFOOTBALL_URL
+        + endpoint
+    )
+
+    try:
+
+        async with httpx.AsyncClient(
+            timeout=20.0
+        ) as client:
+
+            response = await client.get(
+                url,
+                headers=headers,
+                params=params or {}
+            )
+
+            try:
+                data = response.json()
+            except Exception:
+                data = {
+                    "raw": response.text
+                }
+
+            if response.status_code != 200:
+
+                return {
+                    "ok": False,
+                    "status_code": response.status_code,
+                    "data": data,
+                    "error": (
+                        "API-Football respondió "
+                        f"con HTTP {response.status_code}"
+                    )
+                }
+
+            api_errors = (
+                data.get("errors", [])
+                if isinstance(data, dict)
+                else []
+            )
+
+            if api_errors:
+
+                return {
+                    "ok": False,
+                    "status_code": response.status_code,
+                    "data": data,
+                    "error": str(api_errors)
+                }
+
+            return {
+                "ok": True,
+                "status_code": response.status_code,
+                "data": data,
+                "error": None
+            }
+
+    except httpx.RequestError as exc:
+
+        return {
+            "ok": False,
+            "status_code": None,
+            "data": None,
+            "error": str(exc)
+        }
+
+    except Exception as exc:
+
+        return {
+            "ok": False,
+            "status_code": None,
+            "data": None,
+            "error": str(exc)
+        }
+
+
+# ============================================================
+# NORMALIZADORES DE ESTADÍSTICAS
+# ============================================================
+
+def safe_number(value):
+
+    if value is None:
+        return 0
+
+    if isinstance(
+        value,
+        (int, float)
+    ):
+        return value
+
+    try:
+        return float(value)
+    except Exception:
+        return 0
+
+
+def normalizar_player_statistics(
+    player_block: dict
+) -> dict:
+
+    player = player_block.get(
+        "player",
+        {}
+    )
+
+    statistics = player_block.get(
+        "statistics",
+        []
+    )
+
+    if not statistics:
+        statistics = [{}]
+
+    stats = statistics[0] or {}
+
+    shots = stats.get(
+        "shots",
+        {}
+    ) or {}
+
+    goals = stats.get(
+        "goals",
+        {}
+    ) or {}
+
+    passes = stats.get(
+        "passes",
+        {}
+    ) or {}
+
+    fouls = stats.get(
+        "fouls",
+        {}
+    ) or {}
+
+    cards = stats.get(
+        "cards",
+        {}
+    ) or {}
+
+    games = stats.get(
+        "games",
+        {}
+    ) or {}
+
+    return {
+
+        "player_id": player.get(
+            "id"
+        ),
+
+        "player": player.get(
+            "name"
+        ),
+
+        "photo": player.get(
+            "photo"
+        ),
+
+        "team": (
+            player_block.get(
+                "team",
+                {}
+            ).get(
+                "name"
+            )
+        ),
+
+        "team_id": (
+            player_block.get(
+                "team",
+                {}
+            ).get(
+                "id"
+            )
+        ),
+
+        "position": games.get(
+            "position"
+        ),
+
+        "minutes": safe_number(
+            games.get(
+                "minutes"
+            )
+        ),
+
+        "rating": safe_number(
+            games.get(
+                "rating"
+            )
+        ),
+
+        "starter": games.get(
+            "substitute"
+        ) is False,
+
+        "shots": safe_number(
+            shots.get(
+                "total"
+            )
+        ),
+
+        "shots_on_target": safe_number(
+            shots.get(
+                "on"
+            )
+        ),
+
+        "goals": safe_number(
+            goals.get(
+                "total"
+            )
+        ),
+
+        "assists": safe_number(
+            goals.get(
+                "assists"
+            )
+        ),
+
+        "key_passes": safe_number(
+            passes.get(
+                "key"
+            )
+        ),
+
+        "fouls_committed": safe_number(
+            fouls.get(
+                "committed"
+            )
+        ),
+
+        "fouls_drawn": safe_number(
+            fouls.get(
+                "drawn"
+            )
+        ),
+
+        "yellow_cards": safe_number(
+            cards.get(
+                "yellow"
+            )
+        ),
+
+        "red_cards": safe_number(
+            cards.get(
+                "red"
+            )
+        )
+    }
+
+
+# ============================================================
 # MODELOS
 # ============================================================
 
@@ -201,7 +517,9 @@ class BankrollRequest(BaseModel):
 
     bankroll: float
 
-    stake_percent: float = DEFAULT_STAKE_PERCENT
+    stake_percent: float = (
+        DEFAULT_STAKE_PERCENT
+    )
 
 
 class ScannerRequest(BaseModel):
@@ -218,7 +536,9 @@ class ScannerRequest(BaseModel):
 
     bankroll: float = 0
 
-    stake_percent: float = DEFAULT_STAKE_PERCENT
+    stake_percent: float = (
+        DEFAULT_STAKE_PERCENT
+    )
 
     confidence: float = 70
 
@@ -237,13 +557,6 @@ class BetRequest(BaseModel):
 
 
 # ============================================================
-# MEMORIA TEMPORAL DE APUESTAS
-# ============================================================
-
-bets = []
-
-
-# ============================================================
 # ROOT
 # ============================================================
 
@@ -251,11 +564,24 @@ bets = []
 def read_root():
 
     return {
+
         "status": "ok",
+
         "project": "Fútbol Analytics",
-        "version": "1.3.0",
-        "engine": "Player Market Scanner V1.3",
-        "message": "Fútbol Analytics API corriendo"
+
+        "version": "1.4.0",
+
+        "engine": (
+            "Player Market Scanner V1.4"
+        ),
+
+        "api_football": bool(
+            APIFOOTBALL_KEY
+        ),
+
+        "message": (
+            "Fútbol Analytics API corriendo"
+        )
     }
 
 
@@ -267,30 +593,111 @@ def read_root():
 def health():
 
     return {
+
         "status": "healthy",
-        "service": "futbol-analytics-backend",
-        "version": "1.3.0"
+
+        "service": (
+            "futbol-analytics-backend"
+        ),
+
+        "version": "1.4.0",
+
+        "api_football_configured": bool(
+            APIFOOTBALL_KEY
+        )
     }
 
 
 # ============================================================
-# PARTIDOS
+# TEST API-FOOTBALL
+# ============================================================
+
+@app.get("/api/test-apifootball")
+async def test_apifootball():
+
+    result = await apifootball_get(
+        "/status"
+    )
+
+    if not result["ok"]:
+
+        return {
+
+            "status": "error",
+
+            "api_configured": bool(
+                APIFOOTBALL_KEY
+            ),
+
+            "status_code": result[
+                "status_code"
+            ],
+
+            "message": result[
+                "error"
+            ]
+        }
+
+    return {
+
+        "status": "connected",
+
+        "api_configured": True,
+
+        "status_code": result[
+            "status_code"
+        ],
+
+        "api_response": result[
+            "data"
+        ]
+    }
+
+
+# ============================================================
+# PARTIDOS FOOTBALL-DATA.ORG
 # ============================================================
 
 @app.get("/api/matches")
-async def get_matches(days_ahead: int = 1):
+async def get_matches(
+    days_ahead: int = 1
+):
+
+    if not FOOTBALL_DATA_API_KEY:
+
+        return {
+
+            "count": 0,
+
+            "matches": [],
+
+            "error": (
+                "FOOTBALL_DATA_API_KEY "
+                "no está configurada."
+            )
+        }
 
     headers = {
-        "X-Auth-Token": FOOTBALL_DATA_API_KEY
+        "X-Auth-Token":
+            FOOTBALL_DATA_API_KEY
     }
 
-    now_utc = datetime.now(timezone.utc)
+    now_utc = datetime.now(
+        timezone.utc
+    )
 
-    date_from = now_utc.strftime("%Y-%m-%d")
+    date_from = now_utc.strftime(
+        "%Y-%m-%d"
+    )
 
     date_to = (
-        now_utc + timedelta(days=days_ahead)
-    ).strftime("%Y-%m-%d")
+        now_utc
+        + timedelta(
+            days=days_ahead
+        )
+    ).strftime(
+        "%Y-%m-%d"
+    )
 
     url = (
         f"{BASE_URL}/matches"
@@ -313,17 +720,23 @@ async def get_matches(days_ahead: int = 1):
             if response.status_code != 200:
 
                 try:
-                    details = response.json()
+                    details = (
+                        response.json()
+                    )
                 except Exception:
                     details = response.text
 
                 return {
+
                     "count": 0,
+
                     "matches": [],
+
                     "error": (
-                        f"Error en API externa "
+                        "Error en API externa "
                         f"({response.status_code})"
                     ),
+
                     "details": details
                 }
 
@@ -337,10 +750,6 @@ async def get_matches(days_ahead: int = 1):
             processed_matches = []
 
             for match in raw_matches:
-
-                ivj_val = calcular_indice_ivj(
-                    match
-                )
 
                 competition = match.get(
                     "competition",
@@ -357,17 +766,21 @@ async def get_matches(days_ahead: int = 1):
                     {}
                 )
 
-                full_time = match.get(
-                    "score",
-                    {}
-                ).get(
-                    "fullTime",
-                    {}
+                full_time = (
+                    match.get(
+                        "score",
+                        {}
+                    ).get(
+                        "fullTime",
+                        {}
+                    )
                 )
 
                 processed_matches.append({
 
-                    "id": match.get("id"),
+                    "id": match.get(
+                        "id"
+                    ),
 
                     "utcDate": match.get(
                         "utcDate"
@@ -412,7 +825,10 @@ async def get_matches(days_ahead: int = 1):
 
                     "score": full_time,
 
-                    "ivjIndex": ivj_val
+                    "ivjIndex":
+                        calcular_indice_ivj(
+                            match
+                        )
                 })
 
             return {
@@ -425,24 +841,9 @@ async def get_matches(days_ahead: int = 1):
 
                 "dateTo": date_to,
 
-                "matches": processed_matches
+                "matches":
+                    processed_matches
             }
-
-    except httpx.RequestError as exc:
-
-        return {
-
-            "count": 0,
-
-            "matches": [],
-
-            "error": (
-                "Error de conexión "
-                "con el proveedor de datos"
-            ),
-
-            "details": str(exc)
-        }
 
     except Exception as exc:
 
@@ -453,8 +854,7 @@ async def get_matches(days_ahead: int = 1):
             "matches": [],
 
             "error": (
-                "Error interno procesando "
-                "los partidos"
+                "Error procesando partidos"
             ),
 
             "details": str(exc)
@@ -462,7 +862,7 @@ async def get_matches(days_ahead: int = 1):
 
 
 # ============================================================
-# COMPATIBILIDAD CON FRONTEND
+# COMPATIBILIDAD FRONTEND
 # ============================================================
 
 @app.get("/api/partidos-hoy")
@@ -474,11 +874,526 @@ async def partidos_hoy():
 
 
 # ============================================================
-# PLAYER MARKET SCANNER
+# API-FOOTBALL - FIXTURES
+# ============================================================
+
+@app.get("/api/apifootball-fixtures")
+async def apifootball_fixtures(
+    date: Optional[str] = None,
+    league: Optional[int] = None,
+    season: int = CURRENT_SEASON,
+    next: int = 10
+):
+
+    params = {}
+
+    if date:
+
+        params["date"] = date
+
+    elif league:
+
+        params["league"] = league
+
+        params["season"] = season
+
+        params["next"] = next
+
+    else:
+
+        params["date"] = (
+            datetime.now(
+                timezone.utc
+            ).strftime(
+                "%Y-%m-%d"
+            )
+        )
+
+    result = await apifootball_get(
+        "/fixtures",
+        params
+    )
+
+    if not result["ok"]:
+
+        return {
+
+            "status": "error",
+
+            "count": 0,
+
+            "fixtures": [],
+
+            "message": result[
+                "error"
+            ],
+
+            "details": result[
+                "data"
+            ]
+        }
+
+    data = result["data"]
+
+    fixtures = []
+
+    for fixture in data.get(
+        "response",
+        []
+    ):
+
+        fixture_info = fixture.get(
+            "fixture",
+            {}
+        )
+
+        teams = fixture.get(
+            "teams",
+            {}
+        )
+
+        league_info = fixture.get(
+            "league",
+            {}
+        )
+
+        fixtures.append({
+
+            "fixture_id":
+                fixture_info.get(
+                    "id"
+                ),
+
+            "date":
+                fixture_info.get(
+                    "date"
+                ),
+
+            "status":
+                fixture_info.get(
+                    "status",
+                    {}
+                ),
+
+            "league": {
+
+                "id":
+                    league_info.get(
+                        "id"
+                    ),
+
+                "name":
+                    league_info.get(
+                        "name"
+                    ),
+
+                "country":
+                    league_info.get(
+                        "country"
+                    )
+            },
+
+            "home": {
+
+                "id":
+                    teams.get(
+                        "home",
+                        {}
+                    ).get(
+                        "id"
+                    ),
+
+                "name":
+                    teams.get(
+                        "home",
+                        {}
+                    ).get(
+                        "name"
+                    ),
+
+                "logo":
+                    teams.get(
+                        "home",
+                        {}
+                    ).get(
+                        "logo"
+                    )
+            },
+
+            "away": {
+
+                "id":
+                    teams.get(
+                        "away",
+                        {}
+                    ).get(
+                        "id"
+                    ),
+
+                "name":
+                    teams.get(
+                        "away",
+                        {}
+                    ).get(
+                        "name"
+                    ),
+
+                "logo":
+                    teams.get(
+                        "away",
+                        {}
+                    ).get(
+                        "logo"
+                    )
+            }
+        })
+
+    return {
+
+        "status": "ok",
+
+        "count": len(
+            fixtures
+        ),
+
+        "fixtures": fixtures,
+
+        "source": "API-Football",
+
+        "season": season
+    }
+
+
+# ============================================================
+# API-FOOTBALL - JUGADORES DE UN FIXTURE
+# ============================================================
+
+@app.get("/api/fixture-players")
+async def fixture_players(
+    fixture_id: int
+):
+
+    result = await apifootball_get(
+        "/fixtures/players",
+        {
+            "fixture": fixture_id
+        }
+    )
+
+    if not result["ok"]:
+
+        return {
+
+            "status": "error",
+
+            "fixture_id": fixture_id,
+
+            "players": [],
+
+            "message": result[
+                "error"
+            ],
+
+            "details": result[
+                "data"
+            ]
+        }
+
+    data = result["data"]
+
+    players = []
+
+    for team_block in data.get(
+        "response",
+        []
+    ):
+
+        team_info = team_block.get(
+            "team",
+            {}
+        )
+
+        for player_block in (
+            team_block.get(
+                "players",
+                []
+            )
+        ):
+
+            normalized = (
+                normalizar_player_statistics(
+                    player_block
+                )
+            )
+
+            normalized[
+                "team"
+            ] = team_info.get(
+                "name"
+            )
+
+            normalized[
+                "team_id"
+            ] = team_info.get(
+                "id"
+            )
+
+            players.append(
+                normalized
+            )
+
+    return {
+
+        "status": "ok",
+
+        "fixture_id": fixture_id,
+
+        "count": len(
+            players
+        ),
+
+        "players": players,
+
+        "source": "API-Football"
+    }
+
+
+# ============================================================
+# API-FOOTBALL - BUSCAR JUGADOR
+# ============================================================
+
+@app.get("/api/player-search")
+async def player_search(
+    search: str,
+    season: int = CURRENT_SEASON
+):
+
+    result = await apifootball_get(
+        "/players",
+        {
+            "search": search,
+            "season": season
+        }
+    )
+
+    if not result["ok"]:
+
+        return {
+
+            "status": "error",
+
+            "players": [],
+
+            "message": result[
+                "error"
+            ]
+        }
+
+    players = []
+
+    for item in result[
+        "data"
+    ].get(
+        "response",
+        []
+    ):
+
+        player = item.get(
+            "player",
+            {}
+        )
+
+        players.append({
+
+            "id": player.get(
+                "id"
+            ),
+
+            "name": player.get(
+                "name"
+            ),
+
+            "firstname": player.get(
+                "firstname"
+            ),
+
+            "lastname": player.get(
+                "lastname"
+            ),
+
+            "age": player.get(
+                "age"
+            ),
+
+            "nationality": player.get(
+                "nationality"
+            ),
+
+            "photo": player.get(
+                "photo"
+            )
+        })
+
+    return {
+
+        "status": "ok",
+
+        "count": len(
+            players
+        ),
+
+        "players": players,
+
+        "source": "API-Football"
+    }
+
+
+# ============================================================
+# API-FOOTBALL - ESTADÍSTICAS DE TEMPORADA
+# ============================================================
+
+@app.get("/api/player-season")
+async def player_season(
+    player_id: int,
+    season: int = CURRENT_SEASON
+):
+
+    result = await apifootball_get(
+        "/players",
+        {
+            "id": player_id,
+            "season": season
+        }
+    )
+
+    if not result["ok"]:
+
+        return {
+
+            "status": "error",
+
+            "player_id": player_id,
+
+            "statistics": [],
+
+            "message": result[
+                "error"
+            ]
+        }
+
+    response = result[
+        "data"
+    ].get(
+        "response",
+        []
+    )
+
+    if not response:
+
+        return {
+
+            "status": "no_data",
+
+            "player_id": player_id,
+
+            "statistics": [],
+
+            "message": (
+                "No existen estadísticas "
+                "para este jugador."
+            )
+        }
+
+    player = response[0].get(
+        "player",
+        {}
+    )
+
+    statistics = []
+
+    for item in response[0].get(
+        "statistics",
+        []
+    ):
+
+        statistics.append({
+
+            "team": item.get(
+                "team",
+                {}
+            ),
+
+            "league": item.get(
+                "league",
+                {}
+            ),
+
+            "games": item.get(
+                "games",
+                {}
+            ),
+
+            "shots": item.get(
+                "shots",
+                {}
+            ),
+
+            "goals": item.get(
+                "goals",
+                {}
+            ),
+
+            "passes": item.get(
+                "passes",
+                {}
+            ),
+
+            "fouls": item.get(
+                "fouls",
+                {}
+            ),
+
+            "cards": item.get(
+                "cards",
+                {}
+            )
+        })
+
+    return {
+
+        "status": "ok",
+
+        "player": {
+
+            "id": player.get(
+                "id"
+            ),
+
+            "name": player.get(
+                "name"
+            ),
+
+            "photo": player.get(
+                "photo"
+            )
+        },
+
+        "season": season,
+
+        "statistics": statistics,
+
+        "source": "API-Football"
+    }
+
+
+# ============================================================
+# PLAYER MARKET SCANNER - MOTOR
 # ============================================================
 
 @app.post("/api/scanner")
-def scanner(request: ScannerRequest):
+def scanner(
+    request: ScannerRequest
+):
 
     implied_probability = (
         probabilidad_implicita(
@@ -486,15 +1401,19 @@ def scanner(request: ScannerRequest):
         )
     )
 
-    value_edge = calcular_value_edge(
-        request.probability_fa,
-        request.odds
+    value_edge = (
+        calcular_value_edge(
+            request.probability_fa,
+            request.odds
+        )
     )
 
-    fa_rating = calcular_fa_rating(
-        request.probability_fa,
-        value_edge,
-        request.confidence
+    fa_rating = (
+        calcular_fa_rating(
+            request.probability_fa,
+            value_edge,
+            request.confidence
+        )
     )
 
     risk = determinar_riesgo(
@@ -506,47 +1425,63 @@ def scanner(request: ScannerRequest):
         request.stake_percent
     )
 
-    value_positive = value_edge > 0
-
     signal = determinar_senal(
         value_edge
     )
 
+    value_positive = (
+        value_edge > 0
+    )
+
     return {
 
-        "player": request.player,
+        "player":
+            request.player,
 
-        "market": request.market,
+        "market":
+            request.market,
 
-        "line": request.line,
+        "line":
+            request.line,
 
-        "odds": request.odds,
+        "odds":
+            request.odds,
 
-        "probability_fa": request.probability_fa,
+        "probability_fa":
+            request.probability_fa,
 
-        "implied_probability": implied_probability,
+        "implied_probability":
+            implied_probability,
 
-        "value_edge": value_edge,
+        "value_edge":
+            value_edge,
 
-        "fa_rating": fa_rating,
+        "fa_rating":
+            fa_rating,
 
-        "confidence": request.confidence,
+        "confidence":
+            request.confidence,
 
-        "risk": risk,
+        "risk":
+            risk,
 
-        "signal": signal,
+        "signal":
+            signal,
 
-        "stake_percent": min(
-            max(
-                request.stake_percent,
-                MIN_STAKE_PERCENT
+        "stake_percent":
+            min(
+                max(
+                    request.stake_percent,
+                    MIN_STAKE_PERCENT
+                ),
+                MAX_STAKE_PERCENT
             ),
-            MAX_STAKE_PERCENT
-        ),
 
-        "recommended_stake": stake,
+        "recommended_stake":
+            stake,
 
-        "value_positive": value_positive,
+        "value_positive":
+            value_positive,
 
         "recommendation": (
             "OPORTUNIDAD CON VALOR"
@@ -554,122 +1489,372 @@ def scanner(request: ScannerRequest):
             else "SIN VALOR POSITIVO"
         ),
 
-        "motor": "Fútbol Analytics V1.3"
+        "motor":
+            "Fútbol Analytics V1.4"
     }
 
 
 # ============================================================
-# PLAYER MARKET - ESTADO DEL MOTOR
+# PLAYER MARKET - ESTADO
 # ============================================================
 
 @app.get("/api/player-market")
-def player_market():
+async def player_market(
+    fixture_id: Optional[int] = None
+):
 
-    """
-    Endpoint compatible con el frontend actual.
+    if not APIFOOTBALL_KEY:
 
-    IMPORTANTE:
-    No inventa estadísticas.
+        return {
 
-    Mientras no exista una fuente real de
-    estadísticas de jugadores, devuelve
-    estado SIN DATOS REALES.
-    """
+            "status": "waiting_api",
+
+            "available": False,
+
+            "senal": "SIN DATOS",
+
+            "signal": "SIN DATOS",
+
+            "motor":
+                "Fútbol Analytics V1.4",
+
+            "message": (
+                "Configura APIFOOTBALL_KEY "
+                "en Render."
+            )
+        }
+
+    if fixture_id is None:
+
+        fixture_result = (
+            await apifootball_get(
+                "/fixtures",
+                {
+                    "date":
+                        datetime.now(
+                            timezone.utc
+                        ).strftime(
+                            "%Y-%m-%d"
+                        )
+                }
+            )
+        )
+
+        if not fixture_result["ok"]:
+
+            return {
+
+                "status": "error",
+
+                "available": False,
+
+                "message":
+                    fixture_result[
+                        "error"
+                    ]
+            }
+
+        fixtures = (
+            fixture_result[
+                "data"
+            ].get(
+                "response",
+                []
+            )
+        )
+
+        upcoming = []
+
+        for fixture in fixtures:
+
+            status = fixture.get(
+                "fixture",
+                {}
+            ).get(
+                "status",
+                {}
+            ).get(
+                "short"
+            )
+
+            if status in [
+                "NS",
+                "TBD"
+            ]:
+
+                upcoming.append(
+                    fixture
+                )
+
+        if not upcoming:
+
+            return {
+
+                "status":
+                    "waiting_fixture",
+
+                "available": False,
+
+                "senal":
+                    "SIN DATOS",
+
+                "signal":
+                    "SIN DATOS",
+
+                "motor":
+                    "Fútbol Analytics V1.4",
+
+                "message": (
+                    "No hay un fixture "
+                    "próximo disponible."
+                )
+            }
+
+        fixture = upcoming[0]
+
+        fixture_id = (
+            fixture.get(
+                "fixture",
+                {}
+            ).get(
+                "id"
+            )
+        )
+
+    player_result = (
+        await apifootball_get(
+            "/fixtures/players",
+            {
+                "fixture":
+                    fixture_id
+            }
+        )
+    )
+
+    if not player_result["ok"]:
+
+        return {
+
+            "status":
+                "fixture_data_pending",
+
+            "available": False,
+
+            "fixture_id":
+                fixture_id,
+
+            "senal":
+                "SIN DATOS",
+
+            "signal":
+                "SIN DATOS",
+
+            "motor":
+                "Fútbol Analytics V1.4",
+
+            "message": (
+                "El fixture existe, "
+                "pero las estadísticas "
+                "de jugadores todavía "
+                "no están disponibles."
+            ),
+
+            "details":
+                player_result[
+                    "data"
+                ]
+        }
+
+    players = []
+
+    for team_block in (
+        player_result[
+            "data"
+        ].get(
+            "response",
+            []
+        )
+    ):
+
+        team_info = team_block.get(
+            "team",
+            {}
+        )
+
+        for player_block in (
+            team_block.get(
+                "players",
+                []
+            )
+        ):
+
+            normalized = (
+                normalizar_player_statistics(
+                    player_block
+                )
+            )
+
+            normalized[
+                "team"
+            ] = team_info.get(
+                "name"
+            )
+
+            normalized[
+                "team_id"
+            ] = team_info.get(
+                "id"
+            )
+
+            players.append(
+                normalized
+            )
+
+    if not players:
+
+        return {
+
+            "status":
+                "lineups_pending",
+
+            "available": False,
+
+            "fixture_id":
+                fixture_id,
+
+            "players": [],
+
+            "senal":
+                "SIN DATOS",
+
+            "signal":
+                "SIN DATOS",
+
+            "motor":
+                "Fútbol Analytics V1.4",
+
+            "message": (
+                "Todavía no existen "
+                "estadísticas individuales "
+                "para este fixture."
+            )
+        }
 
     return {
 
-        "status": "waiting_data",
+        "status":
+            "real_player_data",
 
-        "available": False,
+        "available": True,
 
-        "jugador": "Sin datos reales",
+        "fixture_id":
+            fixture_id,
 
-        "player": "Sin datos reales",
+        "count":
+            len(players),
 
-        "mercado": "Remates",
+        "players":
+            players,
 
-        "market": "Remates",
+        "markets":
+            SUPPORTED_MARKETS,
 
-        "linea": None,
+        "senal":
+            "DATOS REALES",
 
-        "line": None,
+        "signal":
+            "DATOS REALES",
 
-        "fa_rating": None,
-
-        "faRating": None,
-
-        "probabilidad": None,
-
-        "probability_fa": None,
-
-        "cuota": None,
-
-        "odds": None,
-
-        "probabilidad_implicita": None,
-
-        "value_edge": None,
-
-        "valueEdge": None,
-
-        "senal": "SIN DATOS",
-
-        "signal": "SIN DATOS",
-
-        "motor": "Fútbol Analytics V1.3",
-
-        "tipo": "real_pending",
+        "motor":
+            "Fútbol Analytics V1.4",
 
         "message": (
-            "El motor está preparado para "
-            "recibir estadísticas reales de jugadores."
+            "Estadísticas reales "
+            "recibidas desde API-Football."
         )
     }
 
 
 # ============================================================
-# PLAYER MARKETS - MULTIPLES OPORTUNIDADES
+# PLAYER MARKETS - MULTIPLES
 # ============================================================
 
 @app.get("/api/player-markets")
-def player_markets():
+async def player_markets(
+    fixture_id: Optional[int] = None
+):
 
-    """
-    Endpoint futuro para múltiples mercados.
+    result = await player_market(
+        fixture_id=fixture_id
+    )
 
-    Ejemplo futuro:
+    if not result.get(
+        "available",
+        False
+    ):
 
-    [
-        {
-            jugador: "...",
-            mercado: "Remates",
-            linea: 2.5,
-            probabilidad: 64,
-            cuota: 1.90,
-            value_edge: 11.37,
-            fa_rating: 78
+        return {
+
+            "status":
+                result.get(
+                    "status",
+                    "waiting_data"
+                ),
+
+            "available": False,
+
+            "count": 0,
+
+            "markets": [],
+
+            "players": [],
+
+            "message":
+                result.get(
+                    "message",
+                    "Sin datos reales."
+                ),
+
+            "motor":
+                "Fútbol Analytics V1.4"
         }
-    ]
-
-    Por ahora NO se generan picks ficticios.
-    """
 
     return {
 
-        "status": "waiting_data",
+        "status":
+            "real_player_data",
 
-        "available": False,
+        "available": True,
 
-        "count": 0,
+        "count":
+            result.get(
+                "count",
+                0
+            ),
 
-        "markets": [],
+        "markets":
+            SUPPORTED_MARKETS,
+
+        "players":
+            result.get(
+                "players",
+                []
+            ),
+
+        "fixture_id":
+            result.get(
+                "fixture_id"
+            ),
 
         "message": (
-            "No existen todavía mercados de "
-            "jugadores con estadísticas reales."
+            "Datos reales de jugadores "
+            "disponibles. Las cuotas y "
+            "líneas deben conectarse "
+            "antes de emitir picks."
         ),
 
-        "motor": "Fútbol Analytics V1.3"
+        "motor":
+            "Fútbol Analytics V1.4"
     }
 
 
@@ -697,23 +1882,29 @@ def bankroll_calculator(
 
     return {
 
-        "bankroll": request.bankroll,
-
-        "stake_percent": stake_percent,
-
-        "recommended_stake": stake,
-
-        "minimum_stake": calcular_stake(
+        "bankroll":
             request.bankroll,
-            MIN_STAKE_PERCENT
-        ),
 
-        "maximum_stake": calcular_stake(
-            request.bankroll,
-            MAX_STAKE_PERCENT
-        ),
+        "stake_percent":
+            stake_percent,
 
-        "all_in_allowed": False
+        "recommended_stake":
+            stake,
+
+        "minimum_stake":
+            calcular_stake(
+                request.bankroll,
+                MIN_STAKE_PERCENT
+            ),
+
+        "maximum_stake":
+            calcular_stake(
+                request.bankroll,
+                MAX_STAKE_PERCENT
+            ),
+
+        "all_in_allowed":
+            False
     }
 
 
@@ -728,30 +1919,41 @@ def create_bet(
 
     bet = {
 
-        "id": len(bets) + 1,
+        "id":
+            len(bets) + 1,
 
-        "event": request.event,
+        "event":
+            request.event,
 
-        "market": request.market,
+        "market":
+            request.market,
 
-        "odds": request.odds,
+        "odds":
+            request.odds,
 
-        "stake": request.stake,
+        "stake":
+            request.stake,
 
-        "result": request.result,
+        "result":
+            request.result,
 
-        "created_at": datetime.now(
-            timezone.utc
-        ).isoformat()
+        "created_at":
+            datetime.now(
+                timezone.utc
+            ).isoformat()
     }
 
-    bets.append(bet)
+    bets.append(
+        bet
+    )
 
     return {
 
-        "status": "created",
+        "status":
+            "created",
 
-        "bet": bet
+        "bet":
+            bet
     }
 
 
@@ -760,9 +1962,11 @@ def get_bets():
 
     return {
 
-        "count": len(bets),
+        "count":
+            len(bets),
 
-        "bets": bets
+        "bets":
+            bets
     }
 
 
@@ -773,7 +1977,9 @@ def get_bets():
 @app.get("/api/kpis")
 def get_kpis():
 
-    total_bets = len(bets)
+    total_bets = len(
+        bets
+    )
 
     settled_bets = [
         bet
@@ -800,16 +2006,23 @@ def get_kpis():
 
     for bet in settled_bets:
 
-        stake = bet["stake"]
+        stake = bet[
+            "stake"
+        ]
 
-        odds = bet["odds"]
+        odds = bet[
+            "odds"
+        ]
 
-        result = bet["result"]
+        result = bet[
+            "result"
+        ]
 
         if result == "GANADA":
 
-            profit += stake * (
-                odds - 1
+            profit += (
+                stake
+                * (odds - 1)
             )
 
             wins += 1
@@ -825,43 +2038,63 @@ def get_kpis():
             voids += 1
 
     yield_percent = (
-        (profit / total_staked) * 100
+
+        (
+            profit
+            / total_staked
+        ) * 100
+
         if total_staked > 0
+
         else 0
     )
 
     win_rate = (
-        (wins / (wins + losses)) * 100
+
+        (
+            wins
+            / (wins + losses)
+        ) * 100
+
         if wins + losses > 0
+
         else 0
     )
 
     return {
 
-        "total_bets": total_bets,
+        "total_bets":
+            total_bets,
 
-        "settled_bets": len(
-            settled_bets
-        ),
+        "settled_bets":
+            len(
+                settled_bets
+            ),
 
-        "profit": round(
-            profit,
-            2
-        ),
+        "profit":
+            round(
+                profit,
+                2
+            ),
 
-        "yield": round(
-            yield_percent,
-            2
-        ),
+        "yield":
+            round(
+                yield_percent,
+                2
+            ),
 
-        "win_rate": round(
-            win_rate,
-            2
-        ),
+        "win_rate":
+            round(
+                win_rate,
+                2
+            ),
 
-        "wins": wins,
+        "wins":
+            wins,
 
-        "losses": losses,
+        "losses":
+            losses,
 
-        "voids": voids
+        "voids":
+            voids
     }
