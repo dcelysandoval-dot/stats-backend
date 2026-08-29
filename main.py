@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 
 # ============================================================
 # FÚTBOL ANALYTICS - BACKEND V1.9
-# Sportmonks principal + API-Football fallback
+# Sportmonks principal + API-Football fallback + autenticación V3 robusta
 # ============================================================
 
 APP_VERSION = "1.9.1"
@@ -169,6 +169,18 @@ async def sportmonks_get(
     endpoint: str,
     params: Optional[dict] = None,
 ) -> dict:
+    """
+    Cliente Sportmonks V3.
+
+    Sportmonks admite el token como:
+      1) Header Authorization: <TOKEN>
+      2) Query parameter api_token=<TOKEN>
+
+    Usamos primero el header sin prefijo "Bearer", que es el formato
+    indicado actualmente en la documentación de API 3.0. Si Sportmonks
+    responde 401, hacemos un segundo intento usando api_token como
+    parámetro de consulta para cubrir ambas variantes de autenticación.
+    """
     if not SPORTMONKS_TOKEN:
         return {
             "ok": False,
@@ -178,17 +190,31 @@ async def sportmonks_get(
         }
 
     url = SPORTMONKS_URL + endpoint
+    base_params = dict(params or {})
     headers = {
-        "Authorization": f"Bearer {SPORTMONKS_TOKEN}",
+        "Authorization": SPORTMONKS_TOKEN,
         "Accept": "application/json",
     }
 
-    try:
+    async def make_request(request_headers: dict, request_params: dict):
         async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(
+            return await client.get(
                 url,
-                headers=headers,
-                params=params or {},
+                headers=request_headers,
+                params=request_params,
+            )
+
+    try:
+        # Intento principal: Authorization: <TOKEN>
+        response = await make_request(headers, base_params)
+
+        # Compatibilidad: si devuelve 401, reintentamos con ?api_token=<TOKEN>
+        if response.status_code == 401:
+            query_params = dict(base_params)
+            query_params["api_token"] = SPORTMONKS_TOKEN
+            response = await make_request(
+                {"Accept": "application/json"},
+                query_params,
             )
 
         try:
@@ -197,11 +223,21 @@ async def sportmonks_get(
             data = {"raw": response.text}
 
         if response.status_code != 200:
+            upstream_message = None
+            if isinstance(data, dict):
+                upstream_message = (
+                    data.get("message")
+                    or (data.get("error") if isinstance(data.get("error"), str) else None)
+                )
+
             return {
                 "ok": False,
                 "status_code": response.status_code,
                 "data": data,
-                "error": f"Sportmonks respondió HTTP {response.status_code}.",
+                "error": (
+                    f"Sportmonks respondió HTTP {response.status_code}"
+                    + (f": {upstream_message}" if upstream_message else ".")
+                ),
             }
 
         if isinstance(data, dict) and data.get("message") and not data.get("data"):
