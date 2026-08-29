@@ -10,18 +10,19 @@ from pydantic import BaseModel, Field
 
 
 # ============================================================
-# FÚTBOL ANALYTICS - BACKEND V1.6
+# FÚTBOL ANALYTICS - BACKEND V1.9
+# Sportmonks principal + API-Football fallback
 # ============================================================
 
-APP_VERSION = "1.9.0"
+APP_VERSION = "1.9.1"
 CURRENT_SEASON = int(os.getenv("CURRENT_SEASON", "2026"))
 
 app = FastAPI(
     title="Fútbol Analytics API",
     version=APP_VERSION,
     description=(
-        "Player Market Scanner: selección de partido, "
-        "alineaciones confirmadas, estadísticas de temporada, "
+        "Player Market Scanner con Sportmonks como fuente principal, "
+        "API-Football como respaldo, alineaciones, estadísticas, "
         "proyecciones, Value Edge y bankroll."
     ),
 )
@@ -36,8 +37,11 @@ app.add_middleware(
 
 
 # ============================================================
-# API-FOOTBALL
+# CONFIGURACIÓN DE APIS
 # ============================================================
+
+SPORTMONKS_TOKEN = os.getenv("SPORTMONKS_API_TOKEN", "").strip()
+SPORTMONKS_URL = "https://api.sportmonks.com/v3"
 
 APIFOOTBALL_KEY = os.getenv("APIFOOTBALL_KEY", "").strip()
 APIFOOTBALL_URL = "https://v3.football.api-sports.io"
@@ -65,12 +69,15 @@ TEAM_PLAYER_CACHE_TTL = 300
 # ============================================================
 
 def safe_number(value) -> float:
-    if value is None:
-        return 0.0
-    if isinstance(value, bool):
+    if value is None or isinstance(value, bool):
         return 0.0
     if isinstance(value, (int, float)):
         return float(value)
+    if isinstance(value, dict):
+        if "total" in value:
+            return safe_number(value["total"])
+        if "value" in value:
+            return safe_number(value["value"])
     try:
         return float(value)
     except Exception:
@@ -126,15 +133,14 @@ def calculate_stake(bankroll: float, stake_percent: float) -> float:
 
 
 def poisson_probability_at_least(k: int, lam: float) -> float:
-    """P(X >= k) for Poisson(lambda)."""
     if k <= 0:
         return 1.0
     if lam <= 0:
         return 0.0
 
-    # Sum P(X=x) for x=0..k-1.
     term = math.exp(-lam)
     cumulative = term
+
     for x in range(1, k):
         term *= lam / x
         cumulative += term
@@ -143,14 +149,11 @@ def poisson_probability_at_least(k: int, lam: float) -> float:
 
 
 def probability_over(line: float, projection: float) -> float:
-    # Betting lines such as 0.5, 1.5, 2.5 mean X >= 1,2,3...
     target = math.floor(line) + 1
     return round(poisson_probability_at_least(target, projection) * 100, 2)
 
 
 def probability_under(line: float, projection: float) -> float:
-    # Under 1.5 means X <= 1. For integer lines, use X <= line-1
-    # as the standard strict "under" interpretation.
     target = math.ceil(line) - 1
     if target < 0:
         return 0.0
@@ -159,10 +162,87 @@ def probability_under(line: float, projection: float) -> float:
 
 
 # ============================================================
-# API CLIENT
+# SPORTMONKS CLIENT
 # ============================================================
 
-async def apifootball_get(endpoint: str, params: Optional[dict] = None) -> dict:
+async def sportmonks_get(
+    endpoint: str,
+    params: Optional[dict] = None,
+) -> dict:
+    if not SPORTMONKS_TOKEN:
+        return {
+            "ok": False,
+            "status_code": None,
+            "data": None,
+            "error": "SPORTMONKS_API_TOKEN no está configurada en Render.",
+        }
+
+    url = SPORTMONKS_URL + endpoint
+    headers = {
+        "Authorization": f"Bearer {SPORTMONKS_TOKEN}",
+        "Accept": "application/json",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(
+                url,
+                headers=headers,
+                params=params or {},
+            )
+
+        try:
+            data = response.json()
+        except Exception:
+            data = {"raw": response.text}
+
+        if response.status_code != 200:
+            return {
+                "ok": False,
+                "status_code": response.status_code,
+                "data": data,
+                "error": f"Sportmonks respondió HTTP {response.status_code}.",
+            }
+
+        if isinstance(data, dict) and data.get("message") and not data.get("data"):
+            return {
+                "ok": False,
+                "status_code": response.status_code,
+                "data": data,
+                "error": str(data.get("message")),
+            }
+
+        return {
+            "ok": True,
+            "status_code": response.status_code,
+            "data": data,
+            "error": None,
+        }
+
+    except httpx.RequestError as exc:
+        return {
+            "ok": False,
+            "status_code": None,
+            "data": None,
+            "error": f"Error de conexión con Sportmonks: {exc}",
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status_code": None,
+            "data": None,
+            "error": str(exc),
+        }
+
+
+# ============================================================
+# API-FOOTBALL CLIENT (FALLBACK)
+# ============================================================
+
+async def apifootball_get(
+    endpoint: str,
+    params: Optional[dict] = None,
+) -> dict:
     if not APIFOOTBALL_KEY:
         return {
             "ok": False,
@@ -172,12 +252,11 @@ async def apifootball_get(endpoint: str, params: Optional[dict] = None) -> dict:
         }
 
     headers = {"x-apisports-key": APIFOOTBALL_KEY}
-    url = APIFOOTBALL_URL + endpoint
 
     try:
         async with httpx.AsyncClient(timeout=25.0) as client:
             response = await client.get(
-                url,
+                APIFOOTBALL_URL + endpoint,
                 headers=headers,
                 params=params or {},
             )
@@ -195,13 +274,13 @@ async def apifootball_get(endpoint: str, params: Optional[dict] = None) -> dict:
                 "error": f"API-Football respondió HTTP {response.status_code}.",
             }
 
-        api_errors = data.get("errors", []) if isinstance(data, dict) else []
-        if api_errors:
+        errors = data.get("errors", []) if isinstance(data, dict) else []
+        if errors:
             return {
                 "ok": False,
                 "status_code": response.status_code,
                 "data": data,
-                "error": str(api_errors),
+                "error": str(errors),
             }
 
         return {
@@ -216,7 +295,7 @@ async def apifootball_get(endpoint: str, params: Optional[dict] = None) -> dict:
             "ok": False,
             "status_code": None,
             "data": None,
-            "error": f"Error de conexión: {exc}",
+            "error": f"Error de conexión con API-Football: {exc}",
         }
     except Exception as exc:
         return {
@@ -228,10 +307,36 @@ async def apifootball_get(endpoint: str, params: Optional[dict] = None) -> dict:
 
 
 # ============================================================
-# NORMALIZACIÓN DE STATS
+# SPORTMONKS NORMALIZACIÓN
 # ============================================================
 
-def aggregate_player_statistics(statistics: list) -> dict:
+SPORTMONKS_STAT_TYPES = {
+    42: "shots",
+    52: "goals",
+    56: "fouls_committed",
+    79: "assists",
+    84: "yellow_cards",
+    83: "red_cards",
+    86: "shots_on_target",
+    96: "fouls_drawn",
+    117: "key_passes",
+    118: "rating",
+    119: "minutes",
+    321: "appearances",
+    322: "starts",
+}
+
+
+def stat_value(detail) -> float:
+    value = detail.get("value")
+    if isinstance(value, dict):
+        for key in ("total", "value", "count"):
+            if key in value:
+                return safe_number(value[key])
+    return safe_number(value)
+
+
+def parse_sportmonks_statistics(statistics) -> dict:
     totals = {
         "minutes": 0.0,
         "appearances": 0.0,
@@ -245,60 +350,211 @@ def aggregate_player_statistics(statistics: list) -> dict:
         "fouls_drawn": 0.0,
         "yellow_cards": 0.0,
         "red_cards": 0.0,
+        "rating": 0.0,
     }
 
-    for stat in statistics or []:
-        games = stat.get("games") or {}
-        shots = stat.get("shots") or {}
-        goals = stat.get("goals") or {}
-        passes = stat.get("passes") or {}
-        fouls = stat.get("fouls") or {}
-        cards = stat.get("cards") or {}
+    if isinstance(statistics, dict):
+        statistics = [statistics]
 
-        totals["minutes"] += safe_number(games.get("minutes"))
-        totals["appearances"] += safe_number(games.get("appearences"))
-        totals["starts"] += safe_number(games.get("lineups"))
-        totals["shots"] += safe_number(shots.get("total"))
-        totals["shots_on_target"] += safe_number(shots.get("on"))
-        totals["goals"] += safe_number(goals.get("total"))
-        totals["assists"] += safe_number(goals.get("assists"))
-        totals["key_passes"] += safe_number(passes.get("key"))
-        totals["fouls_committed"] += safe_number(fouls.get("committed"))
-        totals["fouls_drawn"] += safe_number(fouls.get("drawn"))
-        totals["yellow_cards"] += safe_number(cards.get("yellow"))
-        totals["red_cards"] += safe_number(cards.get("red"))
+    for block in statistics or []:
+        details = block.get("details") or block.get("statistics") or []
+        if isinstance(details, dict):
+            details = [details]
 
-    return {k: round2(v) for k, v in totals.items()}
+        for detail in details:
+            type_id = safe_number(detail.get("type_id"))
+            key = SPORTMONKS_STAT_TYPES.get(int(type_id))
+            if key:
+                totals[key] += stat_value(detail)
+
+    return {key: round2(value) for key, value in totals.items()}
 
 
-def normalize_player_season(item: dict) -> dict:
-    player = item.get("player") or {}
-    stats = aggregate_player_statistics(item.get("statistics") or [])
+def normalize_sportmonks_participant(participant: dict) -> dict:
+    meta = participant.get("meta") or {}
+    return {
+        "id": participant.get("id"),
+        "name": participant.get("name"),
+        "logo": participant.get("image_path"),
+        "location": meta.get("location"),
+    }
 
-    minutes = stats["minutes"]
-    appearances = stats["appearances"]
 
-    def per90(value: float) -> float:
+def normalize_sportmonks_fixture(item: dict) -> dict:
+    participants = item.get("participants") or []
+
+    home = next(
+        (
+            p for p in participants
+            if (p.get("meta") or {}).get("location") == "home"
+        ),
+        participants[0] if participants else None,
+    )
+
+    away = next(
+        (
+            p for p in participants
+            if (p.get("meta") or {}).get("location") == "away"
+        ),
+        participants[1] if len(participants) > 1 else None,
+    )
+
+    league = item.get("league") or {}
+    season = item.get("season") or {}
+    state = item.get("state") or {}
+
+    return {
+        "fixture_id": item.get("id"),
+        "date": item.get("starting_at"),
+        "timestamp": item.get("starting_at_timestamp"),
+        "status": {
+            "id": state.get("id"),
+            "name": state.get("name"),
+            "short_name": state.get("short_name"),
+        },
+        "league": {
+            "id": item.get("league_id") or league.get("id"),
+            "name": league.get("name"),
+            "country": (league.get("country") or {}).get("name"),
+        },
+        "season": {
+            "id": item.get("season_id") or season.get("id"),
+            "name": season.get("name"),
+        },
+        "home": normalize_sportmonks_participant(home or {}),
+        "away": normalize_sportmonks_participant(away or {}),
+    }
+
+
+def lineup_type_id(entry: dict) -> int:
+    return int(safe_number(entry.get("type_id")))
+
+
+def normalize_sportmonks_lineups(fixture_item: dict) -> list:
+    raw = fixture_item.get("lineups") or []
+    grouped = {}
+
+    for entry in raw:
+        team_id = entry.get("team_id")
+        if not team_id:
+            continue
+
+        grouped.setdefault(
+            team_id,
+            {
+                "team": {
+                    "id": team_id,
+                    "name": entry.get("team_name"),
+                    "logo": None,
+                },
+                "formation": None,
+                "starters": [],
+                "substitutes": [],
+            },
+        )
+
+        player = {
+            "player_id": entry.get("player_id"),
+            "name": entry.get("player_name"),
+            "number": entry.get("jersey_number"),
+            "position_id": entry.get("position_id"),
+            "formation_field": entry.get("formation_field"),
+            "formation_position": entry.get("formation_position"),
+            "starter": lineup_type_id(entry) == 11,
+            "substitute": lineup_type_id(entry) == 12,
+        }
+
+        if player["starter"]:
+            grouped[team_id]["starters"].append(player)
+        elif player["substitute"]:
+            grouped[team_id]["substitutes"].append(player)
+
+    return list(grouped.values())
+
+
+def normalize_player_from_sportmonks(item: dict, stats: dict) -> dict:
+    minutes = stats.get("minutes", 0.0)
+    appearances = stats.get("appearances", 0.0)
+
+    def per90(value):
         if minutes <= 0:
             return 0.0
         return round2(value / minutes * 90.0)
 
     return {
-        "player_id": player.get("id"),
-        "player": player.get("name"),
-        "photo": player.get("photo"),
-        "age": player.get("age"),
+        "player_id": item.get("id"),
+        "player": (
+            item.get("name")
+            or item.get("display_name")
+            or "Jugador"
+        ),
+        "photo": item.get("image_path"),
+        "age": item.get("age"),
         **stats,
-        "shots_per90": per90(stats["shots"]),
-        "shots_on_target_per90": per90(stats["shots_on_target"]),
-        "goals_per90": per90(stats["goals"]),
-        "assists_per90": per90(stats["assists"]),
-        "fouls_committed_per90": per90(stats["fouls_committed"]),
-        "fouls_drawn_per90": per90(stats["fouls_drawn"]),
-        "yellow_cards_per90": per90(stats["yellow_cards"]),
-        "red_cards_per90": per90(stats["red_cards"]),
-        "key_passes_per90": per90(stats["key_passes"]),
+        "shots_per90": per90(stats.get("shots", 0)),
+        "shots_on_target_per90": per90(stats.get("shots_on_target", 0)),
+        "goals_per90": per90(stats.get("goals", 0)),
+        "assists_per90": per90(stats.get("assists", 0)),
+        "fouls_committed_per90": per90(stats.get("fouls_committed", 0)),
+        "fouls_drawn_per90": per90(stats.get("fouls_drawn", 0)),
+        "yellow_cards_per90": per90(stats.get("yellow_cards", 0)),
+        "key_passes_per90": per90(stats.get("key_passes", 0)),
     }
+
+
+# ============================================================
+# SPORTMONKS FIXTURE HELPERS
+# ============================================================
+
+async def sportmonks_fixture(fixture_id: int, include: str = "") -> dict:
+    params = {}
+    if include:
+        params["include"] = include
+
+    return await sportmonks_get(
+        f"/football/fixtures/{fixture_id}",
+        params,
+    )
+
+
+async def get_sportmonks_fixture_detail(fixture_id: int) -> dict:
+    return await sportmonks_fixture(
+        fixture_id,
+        "participants;league;season;state;lineups;formations",
+    )
+
+
+async def get_sportmonks_player_season(
+    player_id: int,
+    season_id: Optional[int] = None,
+) -> dict:
+    include = "statistics.details.type"
+
+    params = {"include": include}
+
+    if season_id:
+        params["filters"] = f"playerStatisticSeasons:{season_id}"
+
+    return await sportmonks_get(
+        f"/football/players/{player_id}",
+        params,
+    )
+
+
+async def collect_sportmonks_player_stats(
+    player_id: int,
+    season_id: Optional[int],
+) -> dict:
+    result = await get_sportmonks_player_season(
+        player_id,
+        season_id,
+    )
+
+    if not result["ok"]:
+        return {}
+
+    item = result["data"].get("data") or {}
+    return parse_sportmonks_statistics(item.get("statistics") or [])
 
 
 # ============================================================
@@ -311,8 +567,10 @@ def root():
         "status": "ok",
         "project": "Fútbol Analytics",
         "version": APP_VERSION,
-        "engine": "Player Market Scanner V1.6",
-        "api_football": bool(APIFOOTBALL_KEY),
+        "engine": "Player Market Scanner V1.9",
+        "primary_source": "Sportmonks",
+        "sportmonks_configured": bool(SPORTMONKS_TOKEN),
+        "api_football_fallback_configured": bool(APIFOOTBALL_KEY),
         "features": [
             "seleccion_de_partido",
             "alineaciones",
@@ -330,9 +588,52 @@ def health():
     return {
         "status": "healthy",
         "version": APP_VERSION,
+        "sportmonks_configured": bool(SPORTMONKS_TOKEN),
         "api_football_configured": bool(APIFOOTBALL_KEY),
     }
 
+
+# ============================================================
+# TEST SPORTMONKS
+# ============================================================
+
+@app.get("/api/test-sportmonks")
+async def test_sportmonks():
+    date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    result = await sportmonks_get(
+        f"/football/fixtures/date/{date}",
+        {"include": "participants"},
+    )
+
+    if not result["ok"]:
+        return {
+            "status": "error",
+            "api_configured": bool(SPORTMONKS_TOKEN),
+            "status_code": result["status_code"],
+            "message": result["error"],
+            "details": result["data"],
+        }
+
+    fixtures = result["data"].get("data") or []
+
+    return {
+        "status": "connected",
+        "api_configured": True,
+        "status_code": result["status_code"],
+        "date_tested": date,
+        "count": len(fixtures),
+        "source": "Sportmonks",
+        "sample_fixture": (
+            normalize_sportmonks_fixture(fixtures[0])
+            if fixtures else None
+        ),
+    }
+
+
+# ============================================================
+# TEST API-FOOTBALL
+# ============================================================
 
 @app.get("/api/test-apifootball")
 async def test_apifootball():
@@ -367,7 +668,50 @@ async def test_apifootball():
 
 
 # ============================================================
-# FIXTURES - PARTIDOS PARA SELECCIONAR
+# FIXTURES - SPORTMONKS PRINCIPAL
+# ============================================================
+
+@app.get("/api/sportmonks-fixtures")
+async def sportmonks_fixtures(
+    date: Optional[str] = None,
+):
+    target_date = date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    result = await sportmonks_get(
+        f"/football/fixtures/date/{target_date}",
+        {
+            "include": "participants;league;season;state",
+        },
+    )
+
+    if not result["ok"]:
+        return {
+            "status": "error",
+            "count": 0,
+            "fixtures": [],
+            "source": "Sportmonks",
+            "message": result["error"],
+            "details": result["data"],
+        }
+
+    raw = result["data"].get("data") or []
+    fixtures = [normalize_sportmonks_fixture(x) for x in raw]
+
+    fixtures.sort(
+        key=lambda x: x.get("timestamp") or 0
+    )
+
+    return {
+        "status": "ok",
+        "count": len(fixtures),
+        "date": target_date,
+        "fixtures": fixtures,
+        "source": "Sportmonks",
+    }
+
+
+# ============================================================
+# FIXTURES - API FOOTBALL FALLBACK
 # ============================================================
 
 @app.get("/api/apifootball-fixtures")
@@ -411,32 +755,11 @@ async def apifootball_fixtures(
             "fixture_id": fixture.get("id"),
             "date": fixture.get("date"),
             "timestamp": fixture.get("timestamp"),
-            "status": {
-                "long": status.get("long"),
-                "short": status.get("short"),
-                "elapsed": status.get("elapsed"),
-            },
-            "league": {
-                "id": league_info.get("id"),
-                "name": league_info.get("name"),
-                "country": league_info.get("country"),
-                "season": league_info.get("season"),
-            },
-            "home": {
-                "id": (teams.get("home") or {}).get("id"),
-                "name": (teams.get("home") or {}).get("name"),
-                "logo": (teams.get("home") or {}).get("logo"),
-                "winner": (teams.get("home") or {}).get("winner"),
-            },
-            "away": {
-                "id": (teams.get("away") or {}).get("id"),
-                "name": (teams.get("away") or {}).get("name"),
-                "logo": (teams.get("away") or {}).get("logo"),
-                "winner": (teams.get("away") or {}).get("winner"),
-            },
+            "status": status,
+            "league": league_info,
+            "home": teams.get("home"),
+            "away": teams.get("away"),
         })
-
-    fixtures.sort(key=lambda x: x.get("timestamp") or 0)
 
     return {
         "status": "ok",
@@ -448,25 +771,38 @@ async def apifootball_fixtures(
 
 
 # ============================================================
-# FIXTURE DETAIL
+# FIXTURE DETAIL - SPORTMONKS
 # ============================================================
 
 @app.get("/api/fixture")
 async def fixture_detail(fixture_id: int):
-    result = await apifootball_get(
+    result = await get_sportmonks_fixture_detail(fixture_id)
+
+    if result["ok"]:
+        item = result["data"].get("data") or {}
+        return {
+            "status": "ok",
+            "fixture": normalize_sportmonks_fixture(item),
+            "raw": item,
+            "source": "Sportmonks",
+        }
+
+    # Fallback
+    fallback = await apifootball_get(
         "/fixtures",
         {"id": fixture_id},
     )
 
-    if not result["ok"]:
+    if not fallback["ok"]:
         return {
             "status": "error",
             "fixture_id": fixture_id,
             "message": result["error"],
             "details": result["data"],
+            "fallback": fallback["error"],
         }
 
-    response = result["data"].get("response", [])
+    response = fallback["data"].get("response", [])
     if not response:
         return {
             "status": "not_found",
@@ -477,7 +813,7 @@ async def fixture_detail(fixture_id: int):
     item = response[0]
     fixture = item.get("fixture") or {}
     teams = item.get("teams") or {}
-    league_info = item.get("league") or {}
+    league = item.get("league") or {}
 
     return {
         "status": "ok",
@@ -486,35 +822,53 @@ async def fixture_detail(fixture_id: int):
             "date": fixture.get("date"),
             "timestamp": fixture.get("timestamp"),
             "status": fixture.get("status"),
-            "league": league_info,
+            "league": league,
             "home": teams.get("home"),
             "away": teams.get("away"),
         },
+        "source": "API-Football-fallback",
     }
 
 
 # ============================================================
-# LINEUPS - ESTA ES LA CORRECCIÓN CLAVE
+# LINEUPS - SPORTMONKS
 # ============================================================
 
 @app.get("/api/fixture-lineups")
 async def fixture_lineups(fixture_id: int):
-    result = await apifootball_get(
+    result = await get_sportmonks_fixture_detail(fixture_id)
+
+    if result["ok"]:
+        item = result["data"].get("data") or {}
+        lineups = normalize_sportmonks_lineups(item)
+
+        if lineups:
+            return {
+                "status": "confirmed_lineups",
+                "available": True,
+                "fixture_id": fixture_id,
+                "count": len(lineups),
+                "lineups": lineups,
+                "source": "Sportmonks",
+            }
+
+    # Fallback
+    fallback = await apifootball_get(
         "/fixtures/lineups",
         {"fixture": fixture_id},
     )
 
-    if not result["ok"]:
+    if not fallback["ok"]:
         return {
-            "status": "error",
+            "status": "lineups_pending",
             "fixture_id": fixture_id,
             "available": False,
             "lineups": [],
             "message": result["error"],
-            "details": result["data"],
+            "fallback": fallback["error"],
         }
 
-    response = result["data"].get("response", [])
+    response = fallback["data"].get("response", [])
 
     if not response:
         return {
@@ -522,35 +876,30 @@ async def fixture_lineups(fixture_id: int):
             "fixture_id": fixture_id,
             "available": False,
             "lineups": [],
-            "message": (
-                "Las alineaciones todavía no están disponibles "
-                "para este fixture."
-            ),
+            "message": "Las alineaciones todavía no están disponibles.",
         }
 
     lineups = []
 
-    for team_block in response:
-        team = team_block.get("team") or {}
-        coach = team_block.get("coach") or {}
-        formation = team_block.get("formation")
+    for block in response:
+        team = block.get("team") or {}
+        coach = block.get("coach") or {}
 
         starters = []
         substitutes = []
 
-        for p in team_block.get("startXI", []) or []:
-            player = p.get("player") or {}
+        for entry in block.get("startXI", []) or []:
+            player = entry.get("player") or {}
             starters.append({
                 "player_id": player.get("id"),
                 "name": player.get("name"),
                 "number": player.get("number"),
                 "position": player.get("pos"),
-                "grid": player.get("grid"),
                 "starter": True,
             })
 
-        for p in team_block.get("substitutes", []) or []:
-            player = p.get("player") or {}
+        for entry in block.get("substitutes", []) or []:
+            player = entry.get("player") or {}
             substitutes.append({
                 "player_id": player.get("id"),
                 "name": player.get("name"),
@@ -560,17 +909,9 @@ async def fixture_lineups(fixture_id: int):
             })
 
         lineups.append({
-            "team": {
-                "id": team.get("id"),
-                "name": team.get("name"),
-                "logo": team.get("logo"),
-            },
-            "coach": {
-                "id": coach.get("id"),
-                "name": coach.get("name"),
-                "photo": coach.get("photo"),
-            },
-            "formation": formation,
+            "team": team,
+            "coach": coach,
+            "formation": block.get("formation"),
             "starters": starters,
             "substitutes": substitutes,
             "starter_count": len(starters),
@@ -583,33 +924,62 @@ async def fixture_lineups(fixture_id: int):
         "fixture_id": fixture_id,
         "count": len(lineups),
         "lineups": lineups,
-        "source": "API-Football",
+        "source": "API-Football-fallback",
     }
 
 
 # ============================================================
-# PLAYER SEASON
+# PLAYER SEASON - SPORTMONKS
 # ============================================================
 
 @app.get("/api/player-season")
 async def player_season(
     player_id: int,
-    season: int = CURRENT_SEASON,
+    season: Optional[int] = None,
 ):
-    result = await apifootball_get(
-        "/players",
-        {"id": player_id, "season": season},
+    result = await get_sportmonks_player_season(
+        player_id,
+        season,
     )
 
-    if not result["ok"]:
+    if result["ok"]:
+        item = result["data"].get("data") or {}
+        stats = parse_sportmonks_statistics(
+            item.get("statistics") or []
+        )
+
+        normalized = normalize_player_from_sportmonks(
+            item,
+            stats,
+        )
+
+        return {
+            "status": "ok",
+            "season": season,
+            "player": normalized,
+            "source": "Sportmonks",
+        }
+
+    # Fallback
+    fallback = await apifootball_get(
+        "/players",
+        {
+            "id": player_id,
+            "season": season or CURRENT_SEASON,
+        },
+    )
+
+    if not fallback["ok"]:
         return {
             "status": "error",
             "player_id": player_id,
             "statistics": [],
             "message": result["error"],
+            "fallback": fallback["error"],
         }
 
-    response = result["data"].get("response", [])
+    response = fallback["data"].get("response", [])
+
     if not response:
         return {
             "status": "no_data",
@@ -618,85 +988,245 @@ async def player_season(
             "message": "No existen estadísticas para este jugador.",
         }
 
-    normalized = normalize_player_season(response[0])
+    item = response[0]
+    player = item.get("player") or {}
+    stats = {}
+
+    for block in item.get("statistics") or []:
+        games = block.get("games") or {}
+        shots = block.get("shots") or {}
+        goals = block.get("goals") or {}
+        fouls = block.get("fouls") or {}
+        cards = block.get("cards") or {}
+
+        stats["minutes"] = safe_number(games.get("minutes"))
+        stats["appearances"] = safe_number(games.get("appearences"))
+        stats["starts"] = safe_number(games.get("lineups"))
+        stats["shots"] = safe_number(shots.get("total"))
+        stats["shots_on_target"] = safe_number(shots.get("on"))
+        stats["goals"] = safe_number(goals.get("total"))
+        stats["assists"] = safe_number(goals.get("assists"))
+        stats["fouls_committed"] = safe_number(fouls.get("committed"))
+        stats["fouls_drawn"] = safe_number(fouls.get("drawn"))
+        stats["yellow_cards"] = safe_number(cards.get("yellow"))
+
+    minutes = stats.get("minutes", 0)
+
+    def per90(value):
+        return round2(value / minutes * 90) if minutes else 0.0
+
+    normalized = {
+        "player_id": player.get("id"),
+        "player": player.get("name"),
+        "photo": player.get("photo"),
+        **{k: round2(v) for k, v in stats.items()},
+        "shots_per90": per90(stats.get("shots", 0)),
+        "shots_on_target_per90": per90(stats.get("shots_on_target", 0)),
+        "goals_per90": per90(stats.get("goals", 0)),
+        "assists_per90": per90(stats.get("assists", 0)),
+        "fouls_committed_per90": per90(stats.get("fouls_committed", 0)),
+        "fouls_drawn_per90": per90(stats.get("fouls_drawn", 0)),
+        "yellow_cards_per90": per90(stats.get("yellow_cards", 0)),
+    }
 
     return {
         "status": "ok",
-        "season": season,
+        "season": season or CURRENT_SEASON,
         "player": normalized,
-        "source": "API-Football",
+        "source": "API-Football-fallback",
     }
 
 
 # ============================================================
-# FIXTURE ANALYSIS
+# FIXTURE ANALYSIS - SPORTMONKS
 # ============================================================
 
-async def fetch_team_players_all_pages(team_id: int, season: int) -> list:
-    """
-    Recupera las páginas de /players necesarias para encontrar a los
-    titulares y suplentes de una alineación confirmada.
+async def fixture_analysis_sportmonks(
+    fixture_id: int,
+    season: Optional[int] = None,
+):
+    result = await sportmonks_fixture(
+        fixture_id,
+        (
+            "participants;league;season;state;"
+            "lineups.details.type;formations"
+        ),
+    )
 
-    Se usa una caché corta para no repetir llamadas al seleccionar
-    nuevamente el mismo partido.
-    """
-    import time
+    if not result["ok"]:
+        return None, result
 
-    cache_key = (int(team_id), int(season))
-    now = time.time()
-    cached = TEAM_PLAYER_CACHE.get(cache_key)
-    if cached and now - cached["time"] < TEAM_PLAYER_CACHE_TTL:
-        return cached["players"]
+    fixture_item = result["data"].get("data") or {}
+    lineups = normalize_sportmonks_lineups(fixture_item)
 
-    all_items = []
-    page = 1
-    max_pages = 5
+    if not lineups:
+        return {
+            "status": "lineups_pending",
+            "available": False,
+            "fixture_id": fixture_id,
+            "players": [],
+            "message": (
+                "Sportmonks no ha entregado alineaciones "
+                "para este fixture todavía."
+            ),
+            "source": "Sportmonks",
+        }, None
 
-    while page <= max_pages:
-        result = await apifootball_get(
-            "/players",
-            {
-                "team": team_id,
-                "season": season,
-                "page": page,
-            },
-        )
-        if not result["ok"]:
-            break
+    season_id = (
+        safe_number(fixture_item.get("season_id"))
+        or safe_number((fixture_item.get("season") or {}).get("id"))
+        or safe_number(season)
+        or None
+    )
 
-        data = result["data"] or {}
-        items = data.get("response", []) or []
-        all_items.extend(items)
+    players = []
 
-        paging = data.get("paging") or {}
-        current = safe_number(paging.get("current")) or page
-        total = safe_number(paging.get("total")) or current
+    for lineup in lineups:
+        team = lineup.get("team") or {}
+        team_id = team.get("id")
 
-        if current >= total or not items:
-            break
-        page += 1
+        for entry in (
+            lineup.get("starters", [])
+            + lineup.get("substitutes", [])
+        ):
+            pid = entry.get("player_id")
+            if not pid:
+                continue
 
-    TEAM_PLAYER_CACHE[cache_key] = {
-        "time": now,
-        "players": all_items,
-    }
-    return all_items
+            stats = await collect_sportmonks_player_stats(
+                pid,
+                int(season_id) if season_id else None,
+            )
 
+            starter = bool(entry.get("starter"))
+
+            minutes = safe_number(stats.get("minutes"))
+            appearances = safe_number(stats.get("appearances"))
+            starts = safe_number(stats.get("starts"))
+
+            if starter:
+                expected_minutes = 75.0
+                if appearances > 0:
+                    start_rate = starts / appearances
+                    if start_rate >= 0.75:
+                        expected_minutes = 80.0
+                    elif start_rate >= 0.50:
+                        expected_minutes = 77.0
+            else:
+                expected_minutes = 20.0
+
+            def project(key):
+                return round2(
+                    safe_number(stats.get(key + "_per90"))
+                    * expected_minutes / 90.0
+                )
+
+            data_quality = (
+                "ALTA" if minutes >= 900
+                else "MEDIA" if minutes >= 450
+                else "BAJA"
+            )
+
+            confidence = 72 if starter else 48
+            if minutes >= 900:
+                confidence += 10
+            elif minutes >= 450:
+                confidence += 6
+            elif minutes == 0:
+                confidence -= 18
+
+            confidence = max(25, min(95, confidence))
+
+            players.append({
+                "player_id": pid,
+                "player": entry.get("name"),
+                "team": team.get("name"),
+                "team_id": team_id,
+                "number": entry.get("number"),
+                "position_id": entry.get("position_id"),
+                "formation_field": entry.get("formation_field"),
+                "starter": starter,
+                "confirmed_lineup": True,
+                "expected_minutes": expected_minutes,
+                "stats_available": bool(stats),
+                "data_quality": data_quality,
+                "confidence": confidence,
+
+                "minutes_season": minutes,
+                "appearances_season": appearances,
+                "starts_season": starts,
+
+                "shots_season": stats.get("shots", 0),
+                "shots_on_target_season": stats.get("shots_on_target", 0),
+                "goals_season": stats.get("goals", 0),
+                "assists_season": stats.get("assists", 0),
+                "fouls_committed_season": stats.get("fouls_committed", 0),
+                "fouls_drawn_season": stats.get("fouls_drawn", 0),
+                "yellow_cards_season": stats.get("yellow_cards", 0),
+
+                "shots_per90": stats.get("shots_per90", 0),
+                "shots_on_target_per90": stats.get("shots_on_target_per90", 0),
+                "goals_per90": stats.get("goals_per90", 0),
+                "assists_per90": stats.get("assists_per90", 0),
+                "fouls_committed_per90": stats.get("fouls_committed_per90", 0),
+                "fouls_drawn_per90": stats.get("fouls_drawn_per90", 0),
+                "yellow_cards_per90": stats.get("yellow_cards_per90", 0),
+
+                "projection": {
+                    "Remates": project("shots"),
+                    "Remates a puerta": project("shots_on_target"),
+                    "Goles": project("goals"),
+                    "Asistencias": project("assists"),
+                    "Faltas": project("fouls_committed"),
+                    "Tarjetas": project("yellow_cards"),
+                },
+            })
+
+    fixture = normalize_sportmonks_fixture(fixture_item)
+
+    starters = [p for p in players if p["starter"]]
+    substitutes = [p for p in players if not p["starter"]]
+
+    return {
+        "status": "real_player_data",
+        "available": True,
+        "fixture_id": fixture_id,
+        "season": season_id,
+        "fixture": fixture,
+        "lineups_confirmed": True,
+        "count": len(players),
+        "starter_count": len(starters),
+        "substitute_count": len(substitutes),
+        "players": players,
+        "markets": SUPPORTED_MARKETS,
+        "data_quality": (
+            "Alineaciones y estadísticas obtenidas desde Sportmonks. "
+            "Las proyecciones usan estadísticas de temporada y "
+            "minutos esperados; no incluyen cuotas de bookmaker."
+        ),
+        "source": "Sportmonks",
+        "motor": "Fútbol Analytics V1.9",
+    }, None
+
+
+# ============================================================
+# FIXTURE ANALYSIS - FALLBACK API FOOTBALL
+# ============================================================
 
 @app.get("/api/fixture-analysis")
 async def fixture_analysis(
     fixture_id: int,
     season: int = CURRENT_SEASON,
 ):
-    """
-    Flujo pre-partido:
-    1) fixture
-    2) lineups
-    3) estadísticas de temporada de cada equipo
-    4) merge por player_id
-    5) proyecciones por 90 y minutos esperados
-    """
+    primary, error = await fixture_analysis_sportmonks(
+        fixture_id,
+        season,
+    )
 
+    if primary is not None:
+        return primary
+
+    # Si Sportmonks falla, usamos API-Football como respaldo.
     fixture_result = await apifootball_get(
         "/fixtures",
         {"id": fixture_id},
@@ -706,11 +1236,13 @@ async def fixture_analysis(
         return {
             "status": "error",
             "fixture_id": fixture_id,
-            "message": fixture_result["error"],
-            "details": fixture_result["data"],
+            "message": error["error"] if error else "Error",
+            "details": error["data"] if error else None,
+            "fallback": fixture_result["error"],
         }
 
     fixtures = fixture_result["data"].get("response", [])
+
     if not fixtures:
         return {
             "status": "not_found",
@@ -718,10 +1250,10 @@ async def fixture_analysis(
             "message": "Fixture no encontrado.",
         }
 
-    fixture_item = fixtures[0]
-    fixture = fixture_item.get("fixture") or {}
-    teams = fixture_item.get("teams") or {}
-    league = fixture_item.get("league") or {}
+    item = fixtures[0]
+    fixture = item.get("fixture") or {}
+    teams = item.get("teams") or {}
+    league = item.get("league") or {}
 
     lineup_result = await apifootball_get(
         "/fixtures/lineups",
@@ -734,155 +1266,59 @@ async def fixture_analysis(
             "available": False,
             "fixture_id": fixture_id,
             "players": [],
-            "message": (
-                "No fue posible obtener las alineaciones todavía."
-            ),
+            "message": "No fue posible obtener las alineaciones.",
             "details": lineup_result["data"],
         }
 
     lineup_response = lineup_result["data"].get("response", [])
+
     if not lineup_response:
         return {
             "status": "lineups_pending",
             "available": False,
             "fixture_id": fixture_id,
             "players": [],
-            "message": (
-                "Las alineaciones todavía no están disponibles. "
-                "Vuelve a consultar cuando estén confirmadas."
-            ),
+            "message": "Las alineaciones todavía no están disponibles.",
         }
-
-    # Obtener estadísticas de temporada por equipo: 2 llamadas,
-    # en lugar de una llamada por jugador.
-    season_stats_by_player = {}
-
-    team_ids = []
-    for team_block in lineup_response:
-        tid = (team_block.get("team") or {}).get("id")
-        if tid:
-            team_ids.append(tid)
-
-    for team_id in dict.fromkeys(team_ids):
-        team_player_items = await fetch_team_players_all_pages(
-            team_id,
-            season,
-        )
-
-        for item in team_player_items:
-            normalized = normalize_player_season(item)
-            pid = normalized.get("player_id")
-            if pid:
-                season_stats_by_player[pid] = normalized
 
     players = []
 
-    for team_block in lineup_response:
-        team = team_block.get("team") or {}
-        team_id = team.get("id")
-        team_name = team.get("name")
+    for block in lineup_response:
+        team = block.get("team") or {}
 
-        starter_ids = {
-            (x.get("player") or {}).get("id")
-            for x in team_block.get("startXI", []) or []
-        }
-
-        all_lineup_players = (
-            list(team_block.get("startXI", []) or [])
-            + list(team_block.get("substitutes", []) or [])
-        )
-
-        for entry in all_lineup_players:
+        for entry in (
+            list(block.get("startXI", []) or [])
+            + list(block.get("substitutes", []) or [])
+        ):
             p = entry.get("player") or {}
             pid = p.get("id")
             if not pid:
                 continue
 
-            season_stats = season_stats_by_player.get(pid, {})
+            starter = entry in (block.get("startXI", []) or [])
 
-            minutes = safe_number(season_stats.get("minutes"))
-            starts = safe_number(season_stats.get("starts"))
-            appearances = safe_number(season_stats.get("appearances"))
-
-            # Si es titular confirmado, usamos una expectativa prudente.
-            # No asumimos 90 minutos automáticamente.
-            expected_minutes = 75.0 if pid in starter_ids else 20.0
-
-            # Si tiene mucha presencia como titular, elevamos ligeramente
-            # la expectativa sin pasar de 85.
-            if pid in starter_ids and appearances > 0:
-                start_rate = starts / appearances
-                if start_rate >= 0.75:
-                    expected_minutes = 80.0
-                elif start_rate >= 0.50:
-                    expected_minutes = 77.0
-
-            def project(per90_key: str) -> float:
-                per90 = safe_number(season_stats.get(per90_key))
-                return round2(per90 * expected_minutes / 90.0)
-
-            stats_available = bool(season_stats)
-            data_quality = "ALTA" if minutes >= 450 else ("MEDIA" if minutes > 0 else "BAJA")
-            base_confidence = 72 if pid in starter_ids else 48
-            if minutes >= 900:
-                base_confidence += 10
-            elif minutes >= 450:
-                base_confidence += 6
-            elif minutes == 0:
-                base_confidence -= 18
-            base_confidence = max(25, min(95, base_confidence))
-
-            player_row = {
+            # Fallback conserva el formato V1.9, pero sin hacer
+            # múltiples llamadas innecesarias por jugador.
+            players.append({
                 "player_id": pid,
                 "player": p.get("name"),
-                "team": team_name,
-                "team_id": team_id,
+                "team": team.get("name"),
+                "team_id": team.get("id"),
                 "number": p.get("number"),
                 "position": p.get("pos"),
-                "starter": pid in starter_ids,
+                "starter": starter,
                 "confirmed_lineup": True,
-                "expected_minutes": expected_minutes,
-                "stats_available": stats_available,
-                "data_quality": data_quality,
-                "confidence": base_confidence,
-
-                "minutes_season": minutes,
-                "appearances_season": appearances,
-                "starts_season": starts,
-
-                "shots_season": season_stats.get("shots", 0),
-                "shots_on_target_season": season_stats.get("shots_on_target", 0),
-                "goals_season": season_stats.get("goals", 0),
-                "assists_season": season_stats.get("assists", 0),
-                "fouls_committed_season": season_stats.get("fouls_committed", 0),
-                "fouls_drawn_season": season_stats.get("fouls_drawn", 0),
-                "yellow_cards_season": season_stats.get("yellow_cards", 0),
-
-                "shots_per90": season_stats.get("shots_per90", 0),
-                "shots_on_target_per90": season_stats.get("shots_on_target_per90", 0),
-                "goals_per90": season_stats.get("goals_per90", 0),
-                "assists_per90": season_stats.get("assists_per90", 0),
-                "fouls_committed_per90": season_stats.get("fouls_committed_per90", 0),
-                "fouls_drawn_per90": season_stats.get("fouls_drawn_per90", 0),
-                "yellow_cards_per90": season_stats.get("yellow_cards_per90", 0),
-
+                "expected_minutes": 75 if starter else 20,
+                "stats_available": False,
+                "data_quality": "BAJA",
+                "confidence": 55 if starter else 35,
                 "projection": {
-                    "Remates": project("shots_per90"),
-                    "Remates a puerta": project("shots_on_target_per90"),
-                    "Goles": project("goals_per90"),
-                    "Asistencias": project("assists_per90"),
-                    "Faltas": project("fouls_committed_per90"),
-                    "Tarjetas": project("yellow_cards_per90"),
+                    market: 0.0 for market in SUPPORTED_MARKETS
                 },
-            }
-
-            players.append(player_row)
-
-    starters = [p for p in players if p["starter"]]
-    substitutes = [p for p in players if not p["starter"]]
+            })
 
     return {
-        "status": "real_player_data",
+        "status": "lineups_only",
         "available": True,
         "fixture_id": fixture_id,
         "season": season,
@@ -895,17 +1331,12 @@ async def fixture_analysis(
         },
         "lineups_confirmed": True,
         "count": len(players),
-        "starter_count": len(starters),
-        "substitute_count": len(substitutes),
+        "starter_count": sum(1 for p in players if p["starter"]),
+        "substitute_count": sum(1 for p in players if not p["starter"]),
         "players": players,
         "markets": SUPPORTED_MARKETS,
-        "data_quality": (
-            "Las alineaciones son confirmadas. "
-            "Las proyecciones se basan en estadísticas de temporada "
-            "y minutos esperados; no incluyen cuotas de bookmaker."
-        ),
-        "source": "API-Football",
-        "motor": "Fútbol Analytics V1.6",
+        "source": "API-Football-fallback",
+        "motor": "Fútbol Analytics V1.9",
     }
 
 
@@ -923,7 +1354,11 @@ MARKET_KEYS = {
 }
 
 
-def model_probability_for_side(line: float, projection: float, side: str) -> float:
+def model_probability_for_side(
+    line: float,
+    projection: float,
+    side: str,
+) -> float:
     if side == "over":
         return probability_over(line, projection)
     return probability_under(line, projection)
@@ -937,7 +1372,10 @@ def build_market_candidates(players: list, limit: int = 6) -> list:
             continue
 
         for market, key in MARKET_KEYS.items():
-            projection = safe_number(player.get("projection", {}).get(market))
+            projection = safe_number(
+                player.get("projection", {}).get(market)
+            )
+
             if projection <= 0.05:
                 continue
 
@@ -945,15 +1383,28 @@ def build_market_candidates(players: list, limit: int = 6) -> list:
             under_line = max(0.5, math.ceil(projection) + 0.5)
 
             over_prob = model_probability_for_side(
-                over_line, projection, "over"
+                over_line,
+                projection,
+                "over",
             )
             under_prob = model_probability_for_side(
-                under_line, projection, "under"
+                under_line,
+                projection,
+                "under",
             )
 
-            confidence = safe_number(player.get("confidence")) or 50
-            best_side = "over" if over_prob >= under_prob else "under"
-            best_line = over_line if best_side == "over" else under_line
+            confidence = safe_number(
+                player.get("confidence")
+            ) or 50
+
+            best_side = (
+                "over" if over_prob >= under_prob
+                else "under"
+            )
+            best_line = (
+                over_line if best_side == "over"
+                else under_line
+            )
             best_prob = max(over_prob, under_prob)
 
             rating = round(
@@ -979,8 +1430,13 @@ def build_market_candidates(players: list, limit: int = 6) -> list:
                 "probability_fa": round2(best_prob),
                 "fa_rating": rating,
                 "confidence": round2(confidence),
-                "data_quality": player.get("data_quality", "BAJA"),
-                "confirmed_lineup": bool(player.get("confirmed_lineup")),
+                "data_quality": player.get(
+                    "data_quality",
+                    "BAJA",
+                ),
+                "confirmed_lineup": bool(
+                    player.get("confirmed_lineup")
+                ),
             })
 
     candidates.sort(
@@ -991,7 +1447,8 @@ def build_market_candidates(players: list, limit: int = 6) -> list:
         ),
         reverse=True,
     )
-    return candidates[: max(1, min(limit, 20))]
+
+    return candidates[:max(1, min(limit, 20))]
 
 
 @app.get("/api/player-market-scan")
@@ -1000,12 +1457,6 @@ async def player_market_scan(
     season: int = CURRENT_SEASON,
     limit: int = 6,
 ):
-    """
-    Devuelve candidatos estadísticos pre-partido.
-    Las líneas son referencias matemáticas del modelo, NO líneas
-    de bookmaker. El Value Edge solo se calcula cuando existe una
-    cuota real.
-    """
     analysis = await fixture_analysis(
         fixture_id=fixture_id,
         season=season,
@@ -1029,13 +1480,13 @@ async def player_market_scan(
             "Las líneas mostradas son referencias matemáticas. "
             "No representan cuotas ni líneas de bookmaker."
         ),
-        "source": "API-Football",
+        "source": analysis.get("source"),
         "motor": "Fútbol Analytics V1.9",
     }
 
 
 # ============================================================
-# SCANNER
+# SCANNER MANUAL
 # ============================================================
 
 class ScannerRequest(BaseModel):
@@ -1050,13 +1501,18 @@ class ScannerRequest(BaseModel):
         ge=0,
         le=100,
     )
-    confidence: float = Field(default=70, ge=0, le=100)
+    confidence: float = Field(
+        default=70,
+        ge=0,
+        le=100,
+    )
     side: str = "over"
 
 
 @app.post("/api/scanner")
 def scanner(request: ScannerRequest):
     side = request.side.lower().strip()
+
     if side not in {"over", "under"}:
         raise HTTPException(
             status_code=400,
@@ -1074,8 +1530,6 @@ def scanner(request: ScannerRequest):
         request.confidence,
     )
 
-    risk = risk_from_rating(rating)
-    signal = signal_from_edge(edge)
     stake_percent = max(
         MIN_STAKE_PERCENT,
         min(request.stake_percent, MAX_STAKE_PERCENT),
@@ -1088,12 +1542,14 @@ def scanner(request: ScannerRequest):
         "line": request.line,
         "odds": request.odds,
         "probability_fa": request.probability_fa,
-        "implied_probability": implied_probability(request.odds),
+        "implied_probability": implied_probability(
+            request.odds
+        ),
         "value_edge": edge,
         "fa_rating": rating,
         "confidence": request.confidence,
-        "risk": risk,
-        "signal": signal,
+        "risk": risk_from_rating(rating),
+        "signal": signal_from_edge(edge),
         "stake_percent": stake_percent,
         "recommended_stake": calculate_stake(
             request.bankroll,
@@ -1105,7 +1561,7 @@ def scanner(request: ScannerRequest):
             if edge > 0
             else "SIN VALOR POSITIVO"
         ),
-        "motor": "Fútbol Analytics V1.6",
+        "motor": "Fútbol Analytics V1.9",
     }
 
 
@@ -1121,31 +1577,43 @@ class ProjectionScannerRequest(BaseModel):
         ge=0,
         le=100,
     )
-    confidence: float = Field(default=70, ge=0, le=100)
+    confidence: float = Field(
+        default=70,
+        ge=0,
+        le=100,
+    )
     side: str = "over"
 
 
 @app.post("/api/scanner-projection")
-def scanner_projection(request: ProjectionScannerRequest):
+def scanner_projection(
+    request: ProjectionScannerRequest,
+):
     side = request.side.lower().strip()
+
     if side not in {"over", "under"}:
         raise HTTPException(
             status_code=400,
             detail="side debe ser 'over' o 'under'.",
         )
 
-    if side == "over":
-        probability = probability_over(
+    probability = (
+        probability_over(
             request.line,
             request.projection,
         )
-    else:
-        probability = probability_under(
+        if side == "over"
+        else probability_under(
             request.line,
             request.projection,
         )
+    )
 
-    edge = value_edge(probability, request.odds)
+    edge = value_edge(
+        probability,
+        request.odds,
+    )
+
     rating = fa_rating(
         probability,
         edge,
@@ -1165,7 +1633,9 @@ def scanner_projection(request: ProjectionScannerRequest):
         "odds": request.odds,
         "projection": request.projection,
         "probability_fa": probability,
-        "implied_probability": implied_probability(request.odds),
+        "implied_probability": implied_probability(
+            request.odds
+        ),
         "value_edge": edge,
         "fa_rating": rating,
         "confidence": request.confidence,
@@ -1182,7 +1652,7 @@ def scanner_projection(request: ProjectionScannerRequest):
             if edge > 0
             else "SIN VALOR POSITIVO"
         ),
-        "motor": "Fútbol Analytics V1.6",
+        "motor": "Fútbol Analytics V1.9",
     }
 
 
@@ -1246,7 +1716,9 @@ def create_bet(request: BetRequest):
         "odds": request.odds,
         "stake": request.stake,
         "result": request.result,
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "created_at": datetime.now(
+            timezone.utc
+        ).isoformat(),
     }
 
     bets.append(bet)
@@ -1271,7 +1743,11 @@ def get_kpis():
 
     settled = [
         bet for bet in bets
-        if bet["result"] in {"GANADA", "PERDIDA", "ANULADA"}
+        if bet["result"] in {
+            "GANADA",
+            "PERDIDA",
+            "ANULADA",
+        }
     ]
 
     total_staked = sum(
