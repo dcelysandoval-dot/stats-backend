@@ -11,11 +11,11 @@ from pydantic import BaseModel, Field
 
 
 # ============================================================
-# FÚTBOL ANALYTICS - BACKEND V2.2.3
+# FÚTBOL ANALYTICS - BACKEND V2.2.4
 # Sportmonks principal + API-Football fallback + autenticación V3 robusta
 # ============================================================
 
-APP_VERSION = "2.2.1"
+APP_VERSION = "2.2.4"
 # Sportmonks uses numeric season IDs (e.g. 28083), while API-Football
 # uses calendar years (e.g. 2026). Keep them separate.
 CURRENT_SEASON_YEAR = int(os.getenv("CURRENT_SEASON_YEAR", os.getenv("CURRENT_SEASON", "2026")))
@@ -286,10 +286,17 @@ def classify_recommendation(
     rating: float,
     confirmed_lineup: bool,
     stats_available: bool,
+    data_quality: str = "BAJA",
 ) -> str:
-    """Separate technical publication from the stronger recommended pick tier."""
+    """Classify a candidate while preventing weak samples from becoming strong picks.
+
+    A strong recommendation requires at least a medium historical sample.
+    Candidates with strong model numbers but a low historical sample remain
+    visible as PICK_PRECAUCION instead of being promoted to PICK_RECOMENDADO.
+    """
     confidence = safe_number(confidence)
     rating = safe_number(rating)
+    quality = str(data_quality or "BAJA").strip().upper()
 
     if (
         confidence >= 70
@@ -297,7 +304,9 @@ def classify_recommendation(
         and bool(confirmed_lineup)
         and bool(stats_available)
     ):
-        return "PICK_RECOMENDADO"
+        if quality in {"ALTA", "MEDIA"}:
+            return "PICK_RECOMENDADO"
+        return "PICK_PRECAUCION"
 
     if (
         confidence >= 70
@@ -305,6 +314,8 @@ def classify_recommendation(
         and bool(confirmed_lineup)
         and bool(stats_available)
     ):
+        if quality == "BAJA":
+            return "PICK_PRECAUCION"
         return "PUBLICABLE"
 
     return "REVISION"
@@ -2055,7 +2066,7 @@ async def fixture_analysis_sportmonks(
             "minutos esperados; no incluyen cuotas de bookmaker."
         ),
         "source": "Sportmonks",
-        "motor": "Fútbol Analytics V2.2.3",
+        "motor": "Fútbol Analytics V2.2.4",
     }, None
 
 
@@ -2188,7 +2199,7 @@ async def fixture_analysis(
         "players": players,
         "markets": SUPPORTED_MARKETS,
         "source": "API-Football-fallback",
-        "motor": "Fútbol Analytics V2.2.3",
+        "motor": "Fútbol Analytics V2.2.4",
     }
 
 
@@ -2296,11 +2307,13 @@ def build_market_candidates(players: list, limit: int = 6) -> list:
                 confirmed_lineup=confirmed_lineup,
                 stats_available=stats_available,
             )
+            data_quality = str(player.get("data_quality", "BAJA") or "BAJA").upper()
             recommendation = classify_recommendation(
                 confidence=confidence,
                 rating=rating,
                 confirmed_lineup=confirmed_lineup,
                 stats_available=stats_available,
+                data_quality=data_quality,
             )
             candidates.append({
                 "player_id": player.get("player_id"),
@@ -2333,10 +2346,7 @@ def build_market_candidates(players: list, limit: int = 6) -> list:
                 "confidence_band": confidence_band(confidence),
                 "publishable": publishable,
                 "recommendation": recommendation,
-                "data_quality": player.get(
-                    "data_quality",
-                    "BAJA",
-                ),
+                "data_quality": data_quality,
                 "data_quality_reason": player.get(
                     "data_quality_reason",
                     "No disponible",
@@ -2388,6 +2398,10 @@ async def player_market_scan(
         candidate for candidate in candidates
         if candidate.get("recommendation") == "PICK_RECOMENDADO"
     ]
+    caution_candidates = [
+        candidate for candidate in candidates
+        if candidate.get("recommendation") == "PICK_PRECAUCION"
+    ]
     review_candidates = [
         candidate for candidate in candidates
         if candidate.get("confidence_band") == "PRECAUCIÓN"
@@ -2403,6 +2417,7 @@ async def player_market_scan(
         "players_with_projection": analysis.get("players_with_projection", 0),
         "players_publishable": len(publishable_candidates),
         "players_recommended": len(recommended_candidates),
+        "players_caution": len(caution_candidates),
         "players_review": len(review_candidates),
         "candidates": candidates,
         "note": (
@@ -2410,7 +2425,7 @@ async def player_market_scan(
             "No representan cuotas ni líneas de bookmaker."
         ),
         "source": analysis.get("source"),
-        "motor": "Fútbol Analytics V2.2.3",
+        "motor": "Fútbol Analytics V2.2.4",
         "confidence_policy": {
             "alta": "85-100",
             "media": "70-84",
@@ -2424,9 +2439,10 @@ async def player_market_scan(
             "calibrated_probability": "reported probability used by the scanner",
         },
         "publication_policy": {
-            "pick_recomendado": "confidence >= 70 + FA rating >= 80 + alineación confirmada + estadísticas disponibles",
-            "publishable": "confidence >= 70 + FA rating >= 70 + alineación confirmada + estadísticas disponibles",
-            "review_only": "confidence 60-69, independientemente del FA rating, o datos requeridos incompletos",
+            "pick_recomendado": "confidence >= 70 + FA rating >= 80 + alineación confirmada + estadísticas disponibles + data_quality MEDIA/ALTA",
+            "pick_precaucion": "confidence >= 70 + FA rating >= 70, pero data_quality BAJA",
+            "publishable": "confidence >= 70 + FA rating >= 70 + alineación confirmada + estadísticas disponibles + data_quality MEDIA/ALTA",
+            "review_only": "confidence 60-69, data_quality BAJA o datos requeridos incompletos",
             "excluded": "confidence < 60",
         },
     }
@@ -2508,7 +2524,7 @@ def scanner(request: ScannerRequest):
             if edge > 0
             else "SIN VALOR POSITIVO"
         ),
-        "motor": "Fútbol Analytics V2.2.3",
+        "motor": "Fútbol Analytics V2.2.4",
     }
 
 
@@ -2599,7 +2615,7 @@ def scanner_projection(
             if edge > 0
             else "SIN VALOR POSITIVO"
         ),
-        "motor": "Fútbol Analytics V2.2.3",
+        "motor": "Fútbol Analytics V2.2.4",
     }
 
 
