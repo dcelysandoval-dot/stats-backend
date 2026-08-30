@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field
 # Sportmonks principal + API-Football fallback + autenticación V3 robusta
 # ============================================================
 
-APP_VERSION = "2.0.0"
+APP_VERSION = "1.9.2"
 # Sportmonks uses numeric season IDs (e.g. 28083), while API-Football
 # uses calendar years (e.g. 2026). Keep them separate.
 CURRENT_SEASON_YEAR = int(os.getenv("CURRENT_SEASON_YEAR", os.getenv("CURRENT_SEASON", "2026")))
@@ -67,11 +67,8 @@ DEFAULT_STAKE_PERCENT = 2.0
 MAX_STAKE_PERCENT = 3.0
 
 bets = []
-ALLOWED_BET_RESULTS = {"PENDIENTE", "GANADA", "PERDIDA", "ANULADA"}
 TEAM_PLAYER_CACHE = {}
 TEAM_PLAYER_CACHE_TTL = 300
-PLAYER_STATS_CACHE = {}
-PLAYER_STATS_CACHE_TTL = 300
 
 
 # ============================================================
@@ -388,50 +385,11 @@ SPORTMONKS_STAT_TYPES = {
 
 def stat_value(detail) -> float:
     value = detail.get("value")
-
     if isinstance(value, dict):
         for key in ("total", "value", "count"):
-            if key in value and value[key] is not None:
+            if key in value:
                 return safe_number(value[key])
-
     return safe_number(value)
-
-
-def enrich_stats_with_per90(stats: dict) -> dict:
-    """
-    Add per-90 fields to the normalized Sportmonks totals.
-
-    IMPORTANT:
-    parse_sportmonks_statistics() returns season totals. The scanner
-    consumes *_per90 fields, so those fields must be created before
-    fixture_analysis_sportmonks() builds projections.
-    """
-    normalized = {
-        key: round2(value)
-        for key, value in (stats or {}).items()
-    }
-
-    minutes = safe_number(normalized.get("minutes"))
-
-    for key in (
-        "shots",
-        "shots_on_target",
-        "goals",
-        "assists",
-        "key_passes",
-        "fouls_committed",
-        "fouls_drawn",
-        "yellow_cards",
-        "red_cards",
-    ):
-        value = safe_number(normalized.get(key))
-        normalized[f"{key}_per90"] = (
-            round2(value / minutes * 90.0)
-            if minutes > 0
-            else 0.0
-        )
-
-    return normalized
 
 
 def parse_sportmonks_statistics(statistics) -> dict:
@@ -626,67 +584,33 @@ async def get_sportmonks_player_season(
     player_id: int,
     season_id: Optional[int] = None,
 ) -> dict:
-    """Get a player and defensively keep only the requested season."""
     include = "statistics.details.type"
+
     params = {"include": include}
 
-    result = await sportmonks_get(
+    if season_id:
+        params["filters"] = f"playerStatisticSeasons:{season_id}"
+
+    return await sportmonks_get(
         f"/football/players/{player_id}",
         params,
     )
-
-    if not result.get("ok") or season_id is None:
-        return result
-
-    payload = result.get("data") or {}
-    player = payload.get("data") or {}
-    statistics = player.get("statistics") or []
-
-    selected = []
-    for stat in statistics:
-        season = stat.get("season") or {}
-        sid = (
-            stat.get("season_id")
-            or season.get("id")
-            or (season if isinstance(season, int) else None)
-        )
-        if sid is None:
-            continue
-        try:
-            if int(sid) == int(season_id):
-                selected.append(stat)
-        except (TypeError, ValueError):
-            continue
-
-    player["statistics"] = selected
-    payload["data"] = player
-    result["data"] = payload
-    return result
 
 
 async def collect_sportmonks_player_stats(
     player_id: int,
     season_id: Optional[int],
 ) -> dict:
-    cache_key = (int(player_id), int(season_id) if season_id is not None else None)
-    now = datetime.now(timezone.utc).timestamp()
-    cached = PLAYER_STATS_CACHE.get(cache_key)
-    if cached and now - cached["timestamp"] < PLAYER_STATS_CACHE_TTL:
-        return dict(cached["stats"])
+    result = await get_sportmonks_player_season(
+        player_id,
+        season_id,
+    )
 
-    result = await get_sportmonks_player_season(player_id, season_id)
-    if not result.get("ok"):
+    if not result["ok"]:
         return {}
 
-    item = result.get("data", {}).get("data") or {}
-    stats = parse_sportmonks_statistics(item.get("statistics") or [])
-    stats = enrich_stats_with_per90(stats)
-
-    PLAYER_STATS_CACHE[cache_key] = {
-        "timestamp": now,
-        "stats": dict(stats),
-    }
-    return stats
+    item = result["data"].get("data") or {}
+    return parse_sportmonks_statistics(item.get("statistics") or [])
 
 
 # ============================================================
@@ -699,7 +623,7 @@ def root():
         "status": "ok",
         "project": "Fútbol Analytics",
         "version": APP_VERSION,
-        "engine": "Player Market Scanner V2",
+        "engine": "Player Market Scanner V1.9",
         "primary_source": "Sportmonks",
         "sportmonks_configured": bool(SPORTMONKS_TOKEN),
         "api_football_fallback_configured": bool(APIFOOTBALL_KEY),
@@ -1255,23 +1179,6 @@ async def fixture_analysis_sportmonks(
                     * expected_minutes / 90.0
                 )
 
-            stats_available = (
-                minutes > 0
-                or appearances > 0
-                or starts > 0
-                or any(
-                    safe_number(stats.get(key)) > 0
-                    for key in (
-                        "shots",
-                        "shots_on_target",
-                        "goals",
-                        "assists",
-                        "fouls_committed",
-                        "yellow_cards",
-                    )
-                )
-            )
-
             data_quality = (
                 "ALTA" if minutes >= 900
                 else "MEDIA" if minutes >= 450
@@ -1299,7 +1206,7 @@ async def fixture_analysis_sportmonks(
                 "starter": starter,
                 "confirmed_lineup": True,
                 "expected_minutes": expected_minutes,
-                "stats_available": stats_available,
+                "stats_available": bool(stats),
                 "data_quality": data_quality,
                 "confidence": confidence,
 
@@ -1337,14 +1244,6 @@ async def fixture_analysis_sportmonks(
 
     starters = [p for p in players if p["starter"]]
     substitutes = [p for p in players if not p["starter"]]
-    players_with_stats = [p for p in players if p["stats_available"]]
-    players_with_projection = [
-        p for p in players
-        if any(
-            safe_number(v) > 0
-            for v in (p.get("projection") or {}).values()
-        )
-    ]
 
     return {
         "status": "real_player_data",
@@ -1356,8 +1255,6 @@ async def fixture_analysis_sportmonks(
         "count": len(players),
         "starter_count": len(starters),
         "substitute_count": len(substitutes),
-        "players_with_stats": len(players_with_stats),
-        "players_with_projection": len(players_with_projection),
         "players": players,
         "markets": SUPPORTED_MARKETS,
         "data_quality": (
@@ -1366,7 +1263,7 @@ async def fixture_analysis_sportmonks(
             "minutos esperados; no incluyen cuotas de bookmaker."
         ),
         "source": "Sportmonks",
-        "motor": "Fútbol Analytics V2",
+        "motor": "Fútbol Analytics V1.9",
     }, None
 
 
@@ -1497,7 +1394,7 @@ async def fixture_analysis(
         "players": players,
         "markets": SUPPORTED_MARKETS,
         "source": "API-Football-fallback",
-        "motor": "Fútbol Analytics V2",
+        "motor": "Fútbol Analytics V1.9",
     }
 
 
@@ -1537,12 +1434,10 @@ def build_market_candidates(players: list, limit: int = 6) -> list:
                 player.get("projection", {}).get(market)
             )
 
-            if projection < 0.10:
+            if projection <= 0.05:
                 continue
 
-            # Reference lines bracket the projection instead of always placing
-            # the over line above it.
-            over_line = max(0.5, math.floor(projection) - 0.5)
+            over_line = max(0.5, math.floor(projection) + 0.5)
             under_line = max(0.5, math.ceil(projection) + 0.5)
 
             over_prob = model_probability_for_side(
@@ -1634,20 +1529,17 @@ async def player_market_scan(
     )
 
     return {
-        "status": "scanner_ready" if candidates else "scanner_empty",
+        "status": "scanner_ready",
         "fixture_id": fixture_id,
         "season": season,
         "count": len(candidates),
-        "players_analyzed": len(analysis.get("players", [])),
-        "players_with_stats": analysis.get("players_with_stats", 0),
-        "players_with_projection": analysis.get("players_with_projection", 0),
         "candidates": candidates,
         "note": (
             "Las líneas mostradas son referencias matemáticas. "
             "No representan cuotas ni líneas de bookmaker."
         ),
         "source": analysis.get("source"),
-        "motor": "Fútbol Analytics V2",
+        "motor": "Fútbol Analytics V1.9",
     }
 
 
@@ -1727,7 +1619,7 @@ def scanner(request: ScannerRequest):
             if edge > 0
             else "SIN VALOR POSITIVO"
         ),
-        "motor": "Fútbol Analytics V2",
+        "motor": "Fútbol Analytics V1.9",
     }
 
 
@@ -1818,7 +1710,7 @@ def scanner_projection(
             if edge > 0
             else "SIN VALOR POSITIVO"
         ),
-        "motor": "Fútbol Analytics V2",
+        "motor": "Fútbol Analytics V1.9",
     }
 
 
@@ -1875,20 +1767,13 @@ class BetRequest(BaseModel):
 
 @app.post("/api/bets")
 def create_bet(request: BetRequest):
-    result = request.result.strip().upper()
-    if result not in ALLOWED_BET_RESULTS:
-        raise HTTPException(
-            status_code=400,
-            detail="result debe ser PENDIENTE, GANADA, PERDIDA o ANULADA.",
-        )
-
     bet = {
         "id": len(bets) + 1,
         "event": request.event,
         "market": request.market,
         "odds": request.odds,
         "stake": request.stake,
-        "result": result,
+        "result": request.result,
         "created_at": datetime.now(
             timezone.utc
         ).isoformat(),
