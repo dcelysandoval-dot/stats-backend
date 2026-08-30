@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field
 # Sportmonks principal + API-Football fallback + autenticación V3 robusta
 # ============================================================
 
-APP_VERSION = "1.9.2"
+APP_VERSION = "2.0.0"
 # Sportmonks uses numeric season IDs (e.g. 28083), while API-Football
 # uses calendar years (e.g. 2026). Keep them separate.
 CURRENT_SEASON_YEAR = int(os.getenv("CURRENT_SEASON_YEAR", os.getenv("CURRENT_SEASON", "2026")))
@@ -67,8 +67,11 @@ DEFAULT_STAKE_PERCENT = 2.0
 MAX_STAKE_PERCENT = 3.0
 
 bets = []
+ALLOWED_BET_RESULTS = {"PENDIENTE", "GANADA", "PERDIDA", "ANULADA"}
 TEAM_PLAYER_CACHE = {}
 TEAM_PLAYER_CACHE_TTL = 300
+PLAYER_STATS_CACHE = {}
+PLAYER_STATS_CACHE_TTL = 300
 
 
 # ============================================================
@@ -584,33 +587,62 @@ async def get_sportmonks_player_season(
     player_id: int,
     season_id: Optional[int] = None,
 ) -> dict:
+    """Get a player and defensively keep only the requested season."""
     include = "statistics.details.type"
-
     params = {"include": include}
 
-    if season_id:
-        params["filters"] = f"playerStatisticSeasons:{season_id}"
-
-    return await sportmonks_get(
+    result = await sportmonks_get(
         f"/football/players/{player_id}",
         params,
     )
+
+    if not result.get("ok") or season_id is None:
+        return result
+
+    payload = result.get("data") or {}
+    player = payload.get("data") or {}
+    statistics = player.get("statistics") or []
+
+    selected = []
+    for stat in statistics:
+        season = stat.get("season") or {}
+        sid = (
+            stat.get("season_id")
+            or season.get("id")
+            or (season if isinstance(season, int) else None)
+        )
+        if sid is None:
+            continue
+        try:
+            if int(sid) == int(season_id):
+                selected.append(stat)
+        except (TypeError, ValueError):
+            continue
+
+    player["statistics"] = selected
+    payload["data"] = player
+    result["data"] = payload
+    return result
 
 
 async def collect_sportmonks_player_stats(
     player_id: int,
     season_id: Optional[int],
 ) -> dict:
-    result = await get_sportmonks_player_season(
-        player_id,
-        season_id,
-    )
+    cache_key = (int(player_id), int(season_id) if season_id is not None else None)
+    now = datetime.now(timezone.utc).timestamp()
+    cached = PLAYER_STATS_CACHE.get(cache_key)
+    if cached and now - cached["timestamp"] < PLAYER_STATS_CACHE_TTL:
+        return dict(cached["stats"])
 
-    if not result["ok"]:
+    result = await get_sportmonks_player_season(player_id, season_id)
+    if not result.get("ok"):
         return {}
 
-    item = result["data"].get("data") or {}
-    return parse_sportmonks_statistics(item.get("statistics") or [])
+    item = result.get("data", {}).get("data") or {}
+    stats = parse_sportmonks_statistics(item.get("statistics") or [])
+    PLAYER_STATS_CACHE[cache_key] = {"timestamp": now, "stats": dict(stats)}
+    return stats
 
 
 # ============================================================
@@ -1434,10 +1466,12 @@ def build_market_candidates(players: list, limit: int = 6) -> list:
                 player.get("projection", {}).get(market)
             )
 
-            if projection <= 0.05:
+            if projection < 0.10:
                 continue
 
-            over_line = max(0.5, math.floor(projection) + 0.5)
+            # Reference lines bracket the projection instead of always placing
+            # the over line above it.
+            over_line = max(0.5, math.floor(projection) - 0.5)
             under_line = max(0.5, math.ceil(projection) + 0.5)
 
             over_prob = model_probability_for_side(
@@ -1767,13 +1801,20 @@ class BetRequest(BaseModel):
 
 @app.post("/api/bets")
 def create_bet(request: BetRequest):
+    result = request.result.strip().upper()
+    if result not in ALLOWED_BET_RESULTS:
+        raise HTTPException(
+            status_code=400,
+            detail="result debe ser PENDIENTE, GANADA, PERDIDA o ANULADA.",
+        )
+
     bet = {
         "id": len(bets) + 1,
         "event": request.event,
         "market": request.market,
         "odds": request.odds,
         "stake": request.stake,
-        "result": request.result,
+        "result": result,
         "created_at": datetime.now(
             timezone.utc
         ).isoformat(),
