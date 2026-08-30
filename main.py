@@ -586,43 +586,15 @@ async def get_sportmonks_player_season(
 ) -> dict:
     include = "statistics.details.type"
 
-    # Sportmonks season filtering can return an empty statistics block for
-    # valid season IDs. Request the player's statistics and select the
-    # requested season locally, preserving the numeric Sportmonks season ID.
     params = {"include": include}
 
-    result = await sportmonks_get(
+    if season_id:
+        params["filters"] = f"playerStatisticSeasons:{season_id}"
+
+    return await sportmonks_get(
         f"/football/players/{player_id}",
         params,
     )
-
-    if not result.get("ok") or not season_id:
-        return result
-
-    payload = result.get("data") or {}
-    player = payload.get("data") or {}
-    statistics = player.get("statistics") or []
-
-    selected = []
-    for stat in statistics:
-        season = stat.get("season") or {}
-        sid = (
-            stat.get("season_id")
-            or season.get("id")
-            or (stat.get("season") if isinstance(stat.get("season"), int) else None)
-        )
-        if sid is not None and int(sid) == int(season_id):
-            selected.append(stat)
-
-    # Never silently mix seasons. If Sportmonks returned statistics but none
-    # carries the requested season ID, expose an empty statistics list so the
-    # caller can use its fallback rather than reporting cross-season totals.
-    if statistics:
-        player["statistics"] = selected
-        payload["data"] = player
-        result["data"] = payload
-
-    return result
 
 
 async def collect_sportmonks_player_stats(
