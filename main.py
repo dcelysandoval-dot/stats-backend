@@ -388,11 +388,50 @@ SPORTMONKS_STAT_TYPES = {
 
 def stat_value(detail) -> float:
     value = detail.get("value")
+
     if isinstance(value, dict):
         for key in ("total", "value", "count"):
-            if key in value:
+            if key in value and value[key] is not None:
                 return safe_number(value[key])
+
     return safe_number(value)
+
+
+def enrich_stats_with_per90(stats: dict) -> dict:
+    """
+    Add per-90 fields to the normalized Sportmonks totals.
+
+    IMPORTANT:
+    parse_sportmonks_statistics() returns season totals. The scanner
+    consumes *_per90 fields, so those fields must be created before
+    fixture_analysis_sportmonks() builds projections.
+    """
+    normalized = {
+        key: round2(value)
+        for key, value in (stats or {}).items()
+    }
+
+    minutes = safe_number(normalized.get("minutes"))
+
+    for key in (
+        "shots",
+        "shots_on_target",
+        "goals",
+        "assists",
+        "key_passes",
+        "fouls_committed",
+        "fouls_drawn",
+        "yellow_cards",
+        "red_cards",
+    ):
+        value = safe_number(normalized.get(key))
+        normalized[f"{key}_per90"] = (
+            round2(value / minutes * 90.0)
+            if minutes > 0
+            else 0.0
+        )
+
+    return normalized
 
 
 def parse_sportmonks_statistics(statistics) -> dict:
@@ -641,7 +680,12 @@ async def collect_sportmonks_player_stats(
 
     item = result.get("data", {}).get("data") or {}
     stats = parse_sportmonks_statistics(item.get("statistics") or [])
-    PLAYER_STATS_CACHE[cache_key] = {"timestamp": now, "stats": dict(stats)}
+    stats = enrich_stats_with_per90(stats)
+
+    PLAYER_STATS_CACHE[cache_key] = {
+        "timestamp": now,
+        "stats": dict(stats),
+    }
     return stats
 
 
@@ -655,7 +699,7 @@ def root():
         "status": "ok",
         "project": "Fútbol Analytics",
         "version": APP_VERSION,
-        "engine": "Player Market Scanner V1.9",
+        "engine": "Player Market Scanner V2",
         "primary_source": "Sportmonks",
         "sportmonks_configured": bool(SPORTMONKS_TOKEN),
         "api_football_fallback_configured": bool(APIFOOTBALL_KEY),
@@ -1211,6 +1255,23 @@ async def fixture_analysis_sportmonks(
                     * expected_minutes / 90.0
                 )
 
+            stats_available = (
+                minutes > 0
+                or appearances > 0
+                or starts > 0
+                or any(
+                    safe_number(stats.get(key)) > 0
+                    for key in (
+                        "shots",
+                        "shots_on_target",
+                        "goals",
+                        "assists",
+                        "fouls_committed",
+                        "yellow_cards",
+                    )
+                )
+            )
+
             data_quality = (
                 "ALTA" if minutes >= 900
                 else "MEDIA" if minutes >= 450
@@ -1238,7 +1299,7 @@ async def fixture_analysis_sportmonks(
                 "starter": starter,
                 "confirmed_lineup": True,
                 "expected_minutes": expected_minutes,
-                "stats_available": bool(stats),
+                "stats_available": stats_available,
                 "data_quality": data_quality,
                 "confidence": confidence,
 
@@ -1276,6 +1337,14 @@ async def fixture_analysis_sportmonks(
 
     starters = [p for p in players if p["starter"]]
     substitutes = [p for p in players if not p["starter"]]
+    players_with_stats = [p for p in players if p["stats_available"]]
+    players_with_projection = [
+        p for p in players
+        if any(
+            safe_number(v) > 0
+            for v in (p.get("projection") or {}).values()
+        )
+    ]
 
     return {
         "status": "real_player_data",
@@ -1287,6 +1356,8 @@ async def fixture_analysis_sportmonks(
         "count": len(players),
         "starter_count": len(starters),
         "substitute_count": len(substitutes),
+        "players_with_stats": len(players_with_stats),
+        "players_with_projection": len(players_with_projection),
         "players": players,
         "markets": SUPPORTED_MARKETS,
         "data_quality": (
@@ -1295,7 +1366,7 @@ async def fixture_analysis_sportmonks(
             "minutos esperados; no incluyen cuotas de bookmaker."
         ),
         "source": "Sportmonks",
-        "motor": "Fútbol Analytics V1.9",
+        "motor": "Fútbol Analytics V2",
     }, None
 
 
@@ -1426,7 +1497,7 @@ async def fixture_analysis(
         "players": players,
         "markets": SUPPORTED_MARKETS,
         "source": "API-Football-fallback",
-        "motor": "Fútbol Analytics V1.9",
+        "motor": "Fútbol Analytics V2",
     }
 
 
@@ -1563,17 +1634,20 @@ async def player_market_scan(
     )
 
     return {
-        "status": "scanner_ready",
+        "status": "scanner_ready" if candidates else "scanner_empty",
         "fixture_id": fixture_id,
         "season": season,
         "count": len(candidates),
+        "players_analyzed": len(analysis.get("players", [])),
+        "players_with_stats": analysis.get("players_with_stats", 0),
+        "players_with_projection": analysis.get("players_with_projection", 0),
         "candidates": candidates,
         "note": (
             "Las líneas mostradas son referencias matemáticas. "
             "No representan cuotas ni líneas de bookmaker."
         ),
         "source": analysis.get("source"),
-        "motor": "Fútbol Analytics V1.9",
+        "motor": "Fútbol Analytics V2",
     }
 
 
@@ -1653,7 +1727,7 @@ def scanner(request: ScannerRequest):
             if edge > 0
             else "SIN VALOR POSITIVO"
         ),
-        "motor": "Fútbol Analytics V1.9",
+        "motor": "Fútbol Analytics V2",
     }
 
 
@@ -1744,7 +1818,7 @@ def scanner_projection(
             if edge > 0
             else "SIN VALOR POSITIVO"
         ),
-        "motor": "Fútbol Analytics V1.9",
+        "motor": "Fútbol Analytics V2",
     }
 
 
