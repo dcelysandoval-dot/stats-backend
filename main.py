@@ -226,7 +226,9 @@ def confidence_band(confidence: float) -> str:
 
 
 def is_publishable_confidence(confidence: float) -> bool:
-    return safe_number(confidence) >= 60
+    # PRECAUCIÓN (60-69) must never be published as a candidate.
+    # Only MEDIA/ALTA confidence (>=70) is eligible for publication.
+    return safe_number(confidence) >= 70
 
 
 def adjust_rating_for_data_quality(rating: float, confidence: float) -> int:
