@@ -269,12 +269,12 @@ def is_publishable_candidate(
 ) -> bool:
     """Gate publication without weakening the underlying model.
 
-    A caution-level confidence (60-69) can be published only when the
-    candidate itself reaches the FA rating threshold and the key data
-    requirements are present. Confidence still remains visible as PRECAUCIÓN.
+    Candidates below 70 confidence remain review-only, even when the
+    FA rating is high. This prevents a small historical sample from being
+    promoted to a publishable pick.
     """
     return (
-        safe_number(confidence) >= 60
+        safe_number(confidence) >= 70
         and safe_number(rating) >= 70
         and bool(confirmed_lineup)
         and bool(stats_available)
@@ -300,7 +300,7 @@ def classify_recommendation(
         return "PICK_RECOMENDADO"
 
     if (
-        confidence >= 60
+        confidence >= 70
         and rating >= 70
         and bool(confirmed_lineup)
         and bool(stats_available)
@@ -2395,8 +2395,8 @@ async def player_market_scan(
         },
         "publication_policy": {
             "pick_recomendado": "confidence >= 70 + FA rating >= 80 + alineación confirmada + estadísticas disponibles",
-            "publishable": "confidence >= 60 + FA rating >= 70 + alineación confirmada + estadísticas disponibles",
-            "review_only": "confidence 60-69 con FA rating < 70 o datos requeridos incompletos",
+            "publishable": "confidence >= 70 + FA rating >= 70 + alineación confirmada + estadísticas disponibles",
+            "review_only": "confidence 60-69, independientemente del FA rating, o datos requeridos incompletos",
             "excluded": "confidence < 60",
         },
     }
