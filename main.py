@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 # Sportmonks principal + API-Football fallback + autenticación V3 robusta
 # ============================================================
 
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.2.1"
 # Sportmonks uses numeric season IDs (e.g. 28083), while API-Football
 # uses calendar years (e.g. 2026). Keep them separate.
 CURRENT_SEASON_YEAR = int(os.getenv("CURRENT_SEASON_YEAR", os.getenv("CURRENT_SEASON", "2026")))
@@ -175,6 +175,7 @@ def calculate_data_confidence(
     starts: float,
     starter: bool,
     recent_matches: int = 0,
+    recent_minutes: float = 0,
 ) -> int:
     """Return a sample-aware confidence score from 25 to 95.
 
@@ -185,6 +186,7 @@ def calculate_data_confidence(
     appearances = safe_number(appearances)
     starts = safe_number(starts)
     recent_matches = max(0, int(safe_number(recent_matches)))
+    recent_minutes = max(0.0, safe_number(recent_minutes))
 
     score = 40
     if starter:
@@ -224,7 +226,20 @@ def calculate_data_confidence(
     elif recent_matches >= 1:
         score += 2
 
-    if minutes == 0 and appearances == 0 and recent_matches == 0:
+    # Recent minutes add evidence quality when the current season sample is
+    # still small. This is intentionally capped and does not replace the
+    # season sample; it rewards a player who is actually seeing meaningful
+    # minutes in the recent form window.
+    if recent_minutes >= 360:
+        score += 8
+    elif recent_minutes >= 270:
+        score += 6
+    elif recent_minutes >= 180:
+        score += 4
+    elif recent_minutes >= 90:
+        score += 2
+
+    if minutes == 0 and appearances == 0 and recent_matches == 0 and recent_minutes == 0:
         score -= 10
 
     return int(max(25, min(95, round(score))))
@@ -296,16 +311,16 @@ def classify_recommendation(
 
 
 def adjust_rating_for_data_quality(rating: float, confidence: float) -> int:
-    """Penalize the final rating when the historical sample is weak."""
+    """Apply a modest data-quality adjustment to the final rating."""
     rating = safe_number(rating)
     confidence = safe_number(confidence)
 
     if confidence >= 85:
         multiplier = 1.00
     elif confidence >= 70:
-        multiplier = 0.92
+        multiplier = 0.95
     elif confidence >= 60:
-        multiplier = 0.80
+        multiplier = 0.85
     else:
         multiplier = 0.60
 
@@ -1973,6 +1988,7 @@ async def fixture_analysis_sportmonks(
             starts=player.get("starts_season", 0),
             starter=bool(player.get("starter")),
             recent_matches=recent_matches,
+            recent_minutes=player.get("recent_form_minutes", 0),
         )
         player["recent_form_sample_quality"] = (
             "SOLIDA" if recent_matches >= 5
