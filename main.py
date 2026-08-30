@@ -2188,7 +2188,11 @@ def build_market_candidates(players: list, limit: int = 6) -> list:
                 )
             )
 
-            if not is_publishable_confidence(confidence):
+            # Keep medium-evidence opportunities visible for review, but
+            # never label them as publishable picks. This prevents the API
+            # from returning scanner_empty merely because every available
+            # player is in the 60-69 confidence band.
+            if confidence < 60:
                 continue
 
             rating = adjust_rating_for_data_quality(
@@ -2196,6 +2200,7 @@ def build_market_candidates(players: list, limit: int = 6) -> list:
                 confidence,
             )
 
+            publishable = is_publishable_confidence(confidence)
             candidates.append({
                 "player_id": player.get("player_id"),
                 "player": player.get("player"),
@@ -2224,7 +2229,7 @@ def build_market_candidates(players: list, limit: int = 6) -> list:
                 "raw_fa_rating": raw_rating,
                 "confidence": round2(confidence),
                 "confidence_band": confidence_band(confidence),
-                "publishable": is_publishable_confidence(confidence),
+                "publishable": publishable,
                 "data_quality": player.get(
                     "data_quality",
                     "BAJA",
@@ -2273,6 +2278,14 @@ async def player_market_scan(
         analysis.get("players", []),
         limit=limit,
     )
+    publishable_candidates = [
+        candidate for candidate in candidates
+        if candidate.get("publishable")
+    ]
+    review_candidates = [
+        candidate for candidate in candidates
+        if candidate.get("confidence_band") == "PRECAUCIÓN"
+    ]
 
     return {
         "status": "scanner_ready" if candidates else "scanner_empty",
@@ -2282,7 +2295,8 @@ async def player_market_scan(
         "players_analyzed": len(analysis.get("players", [])),
         "players_with_stats": analysis.get("players_with_stats", 0),
         "players_with_projection": analysis.get("players_with_projection", 0),
-        "players_publishable": len(candidates),
+        "players_publishable": len(publishable_candidates),
+        "players_review": len(review_candidates),
         "candidates": candidates,
         "note": (
             "Las líneas mostradas son referencias matemáticas. "
@@ -2295,6 +2309,11 @@ async def player_market_scan(
             "media": "70-84",
             "precaucion": "60-69",
             "no_publicar": "<60",
+        },
+        "publication_policy": {
+            "publishable": "confidence >= 70",
+            "review_only": "60-69",
+            "excluded": "<60",
         },
     }
 
