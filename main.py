@@ -606,14 +606,18 @@ async def get_sportmonks_player_season(
     selected = []
     for stat in statistics:
         season = stat.get("season") or {}
-        sid = season.get("id")
+        sid = (
+            stat.get("season_id")
+            or season.get("id")
+            or (stat.get("season") if isinstance(stat.get("season"), int) else None)
+        )
         if sid is not None and int(sid) == int(season_id):
             selected.append(stat)
 
-    # Keep only the requested season when Sportmonks supplied season IDs.
-    # If no season metadata is available, leave the response untouched so
-    # existing normalization/fallback behavior is preserved.
-    if selected:
+    # Never silently mix seasons. If Sportmonks returned statistics but none
+    # carries the requested season ID, expose an empty statistics list so the
+    # caller can use its fallback rather than reporting cross-season totals.
+    if statistics:
         player["statistics"] = selected
         payload["data"] = player
         result["data"] = payload
