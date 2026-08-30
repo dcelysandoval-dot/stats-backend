@@ -1,6 +1,7 @@
 import os
 import math
-from datetime import datetime, timezone
+import asyncio
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import httpx
@@ -72,6 +73,10 @@ TEAM_PLAYER_CACHE = {}
 TEAM_PLAYER_CACHE_TTL = 300
 PLAYER_STATS_CACHE = {}
 PLAYER_STATS_CACHE_TTL = 300
+RECENT_FORM_CACHE = {}
+RECENT_FORM_CACHE_TTL = 300
+RECENT_FORM_MATCHES = 8
+RECENT_FORM_LOOKBACK_DAYS = 120
 
 
 # ============================================================
@@ -493,6 +498,69 @@ def stat_value(detail) -> float:
     return safe_number(value)
 
 
+def blend_season_and_recent_per90(
+    season_stats: dict,
+    recent_matches: list,
+    key: str,
+    expected_minutes: float,
+) -> dict:
+    """Blend season and recent per-90 rates with a sample-aware recency weight.
+
+    Recent form is deliberately conservative: one or two matches cannot
+    override a meaningful season sample. The recent window receives 25%, 45%,
+    or 60% weight once it reaches 1, 3, or 5 appearances respectively.
+    """
+    season_minutes = safe_number((season_stats or {}).get("minutes"))
+    season_total = safe_number((season_stats or {}).get(key))
+    season_per90 = (
+        season_total / season_minutes * 90.0
+        if season_minutes > 0 else 0.0
+    )
+
+    valid = [
+        row for row in (recent_matches or [])
+        if safe_number(row.get("minutes")) > 0
+    ]
+    recent_minutes = sum(safe_number(row.get("minutes")) for row in valid)
+    recent_total = sum(safe_number(row.get(key)) for row in valid)
+    recent_appearances = len(valid)
+    recent_per90 = (
+        recent_total / recent_minutes * 90.0
+        if recent_minutes > 0 else 0.0
+    )
+
+    if recent_appearances >= 5:
+        recent_weight = 0.60
+    elif recent_appearances >= 3:
+        recent_weight = 0.45
+    elif recent_appearances >= 1:
+        recent_weight = 0.25
+    else:
+        recent_weight = 0.0
+
+    if season_minutes <= 0:
+        blended_per90 = recent_per90
+    elif recent_appearances == 0:
+        blended_per90 = season_per90
+    else:
+        blended_per90 = (
+            season_per90 * (1.0 - recent_weight)
+            + recent_per90 * recent_weight
+        )
+
+    projection = blended_per90 * safe_number(expected_minutes) / 90.0
+
+    return {
+        "season_per90": round2(season_per90),
+        "recent_per90": round2(recent_per90),
+        "blended_per90": round2(blended_per90),
+        "recent_minutes": round2(recent_minutes),
+        "recent_appearances": recent_appearances,
+        "recent_weight": round2(recent_weight),
+        "projection": round2(projection),
+    }
+
+
 def enrich_stats_with_per90(stats: dict) -> dict:
     """
     Add per-90 fields to the normalized Sportmonks totals.
@@ -528,6 +596,100 @@ def enrich_stats_with_per90(stats: dict) -> dict:
         )
 
     return normalized
+
+
+def aggregate_recent_fixture_player_stats(fixtures: list, team_id: int) -> dict:
+    """Normalize per-match player statistics from recent team fixtures.
+
+    Only players with recorded minutes are returned. This prevents unused
+    substitutes from inflating the appearance sample.
+    """
+    result = {}
+    metric_types = {
+        42: "shots",
+        86: "shots_on_target",
+        52: "goals",
+        79: "assists",
+        56: "fouls_committed",
+        96: "fouls_drawn",
+        84: "yellow_cards",
+        119: "minutes",
+    }
+
+    for fixture in fixtures or []:
+        fixture_id = fixture.get("id")
+        timestamp = fixture.get("starting_at_timestamp")
+        for lineup in fixture.get("lineups") or []:
+            if safe_number(lineup.get("team_id")) != safe_number(team_id):
+                continue
+
+            player_id = lineup.get("player_id")
+            if not player_id:
+                continue
+
+            row = {
+                "fixture_id": fixture_id,
+                "timestamp": timestamp,
+                "minutes": 0.0,
+                "shots": 0.0,
+                "shots_on_target": 0.0,
+                "goals": 0.0,
+                "assists": 0.0,
+                "fouls_committed": 0.0,
+                "fouls_drawn": 0.0,
+                "yellow_cards": 0.0,
+                "started": lineup_type_id(lineup) == 11,
+            }
+
+            for detail in lineup.get("details") or []:
+                key = metric_types.get(int(safe_number(detail.get("type_id"))))
+                if key:
+                    row[key] += stat_value({"value": detail.get("data", detail.get("value"))})
+
+            # No recorded minutes means the player did not participate.
+            if row["minutes"] <= 0:
+                continue
+
+            result.setdefault(player_id, []).append(row)
+
+    for rows in result.values():
+        rows.sort(key=lambda x: x.get("timestamp") or 0, reverse=True)
+
+    return result
+
+
+def apply_recent_form_to_player(player: dict, recent_by_metric: dict) -> dict:
+    """Apply recency-weighted rates to a normalized player in-place."""
+    market_to_key = {
+        "Remates": ("shots", "shots_per90"),
+        "Remates a puerta": ("shots_on_target", "shots_on_target_per90"),
+        "Goles": ("goals", "goals_per90"),
+        "Asistencias": ("assists", "assists_per90"),
+        "Faltas": ("fouls_committed", "fouls_committed_per90"),
+        "Tarjetas": ("yellow_cards", "yellow_cards_per90"),
+    }
+
+    player.setdefault("projection", {})
+    player["recent_form"] = {}
+
+    season_stats = {
+        "minutes": player.get("minutes_season", 0),
+    }
+    for metric, _per90 in market_to_key.values():
+        season_stats[metric] = player.get(f"{metric}_season", 0)
+
+    for market, (metric, per90_key) in market_to_key.items():
+        result = blend_season_and_recent_per90(
+            season_stats,
+            (recent_by_metric or {}).get(metric, []),
+            metric,
+            player.get("expected_minutes", 0),
+        )
+        player[per90_key + "_blended"] = result["blended_per90"]
+        player["recent_form"][market] = result
+        player["projection"][market] = result["projection"]
+
+    return player
 
 
 def parse_sportmonks_statistics(statistics) -> dict:
@@ -680,9 +842,6 @@ def normalize_sportmonks_lineups(fixture_item: dict) -> list:
             group["team"]["logo"] = team_logo
 
         player_obj = entry.get("player") or {}
-        type_id = lineup_type_id(entry)
-        explicit_starter = entry.get("starter") is True
-        explicit_substitute = entry.get("substitute") is True
         player = {
             "player_id": entry.get("player_id") or player_obj.get("id"),
             "name": entry.get("player_name") or player_obj.get("name"),
@@ -690,12 +849,8 @@ def normalize_sportmonks_lineups(fixture_item: dict) -> list:
             "position_id": entry.get("position_id"),
             "formation_field": entry.get("formation_field"),
             "formation_position": entry.get("formation_position"),
-            # Sportmonks normally uses type_id 11/12, but some responses
-            # expose explicit starter/substitute booleans instead. Prefer
-            # the explicit flags when present so confirmed XI players are
-            # not silently dropped by the scanner.
-            "starter": explicit_starter or (not explicit_substitute and type_id == 11),
-            "substitute": explicit_substitute or (not explicit_starter and type_id == 12),
+            "starter": lineup_type_id(entry) == 11,
+            "substitute": lineup_type_id(entry) == 12,
         }
 
         if player["starter"]:
@@ -822,6 +977,114 @@ async def get_sportmonks_player_season(
     player["statistics"] = selected
     payload["data"] = player
     result["data"] = payload
+    return result
+
+
+async def get_recent_team_fixtures(
+    team_id: int,
+    season_id: int,
+    before_timestamp: Optional[int],
+) -> list:
+    """Fetch the most recent completed fixtures for one team."""
+    if not team_id or not season_id:
+        return []
+
+    if before_timestamp:
+        end_dt = datetime.fromtimestamp(
+            int(before_timestamp),
+            tz=timezone.utc,
+        ) - timedelta(days=1)
+    else:
+        end_dt = datetime.now(timezone.utc) - timedelta(days=1)
+
+    start_dt = end_dt - timedelta(days=RECENT_FORM_LOOKBACK_DAYS)
+    cache_key = (
+        int(team_id),
+        int(season_id),
+        end_dt.date().isoformat(),
+    )
+    now = datetime.now(timezone.utc).timestamp()
+    cached = RECENT_FORM_CACHE.get(cache_key)
+    if cached and now - cached["timestamp"] < RECENT_FORM_CACHE_TTL:
+        return list(cached["fixtures"])
+
+    endpoint = (
+        f"/football/fixtures/between/date/"
+        f"{start_dt.date().isoformat()}/"
+        f"{end_dt.date().isoformat()}/"
+        f"{int(team_id)}"
+    )
+    params = {
+        "include": "lineups.details",
+        "order": "desc",
+        "per_page": max(RECENT_FORM_MATCHES * 2, 12),
+    }
+
+    result = await sportmonks_get(endpoint, params)
+    if not result.get("ok"):
+        return []
+
+    fixtures = (result.get("data") or {}).get("data") or []
+    completed = []
+    for fixture in fixtures:
+        ts = safe_number(fixture.get("starting_at_timestamp"))
+        if before_timestamp and ts >= safe_number(before_timestamp):
+            continue
+        if safe_number(fixture.get("season_id")) != safe_number(season_id):
+            continue
+        if not fixture.get("lineups"):
+            continue
+        completed.append(fixture)
+
+    completed.sort(
+        key=lambda x: safe_number(x.get("starting_at_timestamp")),
+        reverse=True,
+    )
+    completed = completed[:RECENT_FORM_MATCHES]
+
+    RECENT_FORM_CACHE[cache_key] = {
+        "timestamp": now,
+        "fixtures": list(completed),
+    }
+    return completed
+
+
+async def get_recent_player_form(
+    team_id: int,
+    season_id: int,
+    before_timestamp: Optional[int],
+) -> dict:
+    fixtures = await get_recent_team_fixtures(
+        team_id,
+        season_id,
+        before_timestamp,
+    )
+    per_player = aggregate_recent_fixture_player_stats(
+        fixtures,
+        team_id,
+    )
+
+    metric_map = {
+        "shots": "shots",
+        "shots_on_target": "shots_on_target",
+        "goals": "goals",
+        "assists": "assists",
+        "fouls_committed": "fouls_committed",
+        "yellow_cards": "yellow_cards",
+    }
+    result = {}
+    for player_id, rows in per_player.items():
+        result[player_id] = {
+            key: [
+                {
+                    "minutes": row.get("minutes", 0),
+                    key: row.get(key, 0),
+                    "started": row.get("started", False),
+                }
+                for row in rows
+            ]
+            for key in metric_map.values()
+        }
     return result
 
 
@@ -1553,6 +1816,48 @@ async def fixture_analysis_sportmonks(
                 },
             })
 
+    # Recency layer: fetch the latest completed team fixtures once per team
+    # and reuse them for every player in the current lineup. This avoids the
+    # previous problem where projections were based almost entirely on a tiny
+    # season sample such as 1-2 appearances.
+    before_timestamp = fixture_item.get("starting_at_timestamp")
+    team_ids = sorted({
+        int(p["team_id"])
+        for p in players
+        if p.get("team_id") is not None
+    })
+    recent_tasks = [
+        get_recent_player_form(
+            team_id,
+            int(season_id),
+            int(before_timestamp) if before_timestamp else None,
+        )
+        for team_id in team_ids
+    ]
+    recent_results = (
+        await asyncio.gather(*recent_tasks)
+        if recent_tasks else []
+    )
+    recent_by_team = dict(zip(team_ids, recent_results))
+
+    for player in players:
+        team_form = recent_by_team.get(int(player["team_id"])) if player.get("team_id") is not None else {}
+        recent_by_metric = (team_form or {}).get(player.get("player_id"), {})
+        apply_recent_form_to_player(player, recent_by_metric)
+
+        player["recent_form_available"] = bool(recent_by_metric)
+        player["recent_form_matches"] = max(
+            [
+                len(value)
+                for value in (recent_by_metric or {}).values()
+            ] or [0]
+        )
+        player["projection_method"] = (
+            "temporada + forma reciente"
+            if recent_by_metric
+            else "temporada"
+        )
+
     fixture = normalize_sportmonks_fixture(fixture_item)
 
     starters = [p for p in players if p["starter"]]
@@ -1822,9 +2127,13 @@ def build_market_candidates(players: list, limit: int = 6) -> list:
                 "expected_minutes": round2(player.get("expected_minutes")),
                 "projection_basis": {
                     "per90": round2(player.get(key)),
+                    "blended_per90": round2(player.get(key + "_blended")) or round2(player.get(key)),
                     "expected_minutes": round2(player.get("expected_minutes")),
                     "season_minutes": round2(player.get("minutes_season")),
                     "season_appearances": round2(player.get("appearances_season")),
+                    "recent_form_matches": player.get("recent_form_matches", 0),
+                    "recent_form_available": bool(player.get("recent_form_available")),
+                    "method": player.get("projection_method", "temporada"),
                 },
                 "reference_side": best_side,
                 "reference_line": round2(best_line),
@@ -1842,6 +2151,11 @@ def build_market_candidates(players: list, limit: int = 6) -> list:
                     "data_quality_reason",
                     "No disponible",
                 ),
+                "projection_method": player.get(
+                    "projection_method",
+                    "temporada",
+                ),
+                "recent_form_matches": player.get("recent_form_matches", 0),
                 "confirmed_lineup": bool(
                     player.get("confirmed_lineup")
                 ),
