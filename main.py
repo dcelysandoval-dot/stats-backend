@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 
 
 # ============================================================
-# FÚTBOL ANALYTICS - BACKEND V2.2
+# FÚTBOL ANALYTICS - BACKEND V2.2.3
 # Sportmonks principal + API-Football fallback + autenticación V3 robusta
 # ============================================================
 
@@ -348,17 +348,37 @@ def poisson_probability_at_least(k: int, lam: float) -> float:
     return max(0.0, min(1.0, 1.0 - cumulative))
 
 
-def probability_over(line: float, projection: float) -> float:
+def calibrate_probability(raw_probability: float, confidence: float) -> float:
+    """Shrink point-estimate probabilities toward 50% when sample confidence is limited.
+
+    The Poisson probability is conditional on a point projection. In a live
+    scanner the projection itself is uncertain, especially with small samples.
+    This calibration avoids presenting 98-99% as if it were a fully calibrated
+    event probability when the historical sample is weak.
+    """
+    raw = max(0.0, min(100.0, safe_number(raw_probability)))
+    conf = max(0.0, min(100.0, safe_number(confidence)))
+
+    # Reliability grows with confidence, but never reaches 100% from the
+    # projection alone. This deliberately regularizes extreme probabilities.
+    reliability = 0.35 + 0.55 * (conf / 100.0)
+    calibrated = 50.0 + (raw - 50.0) * reliability
+    return round(max(1.0, min(99.0, calibrated)), 2)
+
+
+def probability_over(line: float, projection: float, confidence: float = 70) -> float:
     target = math.floor(line) + 1
-    return round(poisson_probability_at_least(target, projection) * 100, 2)
+    raw = poisson_probability_at_least(target, projection) * 100
+    return calibrate_probability(raw, confidence)
 
 
-def probability_under(line: float, projection: float) -> float:
+def probability_under(line: float, projection: float, confidence: float = 70) -> float:
     target = math.ceil(line) - 1
     if target < 0:
         return 0.0
     at_least = poisson_probability_at_least(target + 1, projection)
-    return round((1.0 - at_least) * 100, 2)
+    raw = (1.0 - at_least) * 100
+    return calibrate_probability(raw, confidence)
 
 
 # ============================================================
@@ -2035,7 +2055,7 @@ async def fixture_analysis_sportmonks(
             "minutos esperados; no incluyen cuotas de bookmaker."
         ),
         "source": "Sportmonks",
-        "motor": "Fútbol Analytics V2.2",
+        "motor": "Fútbol Analytics V2.2.3",
     }, None
 
 
@@ -2168,7 +2188,7 @@ async def fixture_analysis(
         "players": players,
         "markets": SUPPORTED_MARKETS,
         "source": "API-Football-fallback",
-        "motor": "Fútbol Analytics V2.2",
+        "motor": "Fútbol Analytics V2.2.3",
     }
 
 
@@ -2190,10 +2210,11 @@ def model_probability_for_side(
     line: float,
     projection: float,
     side: str,
+    confidence: float = 70,
 ) -> float:
     if side == "over":
-        return probability_over(line, projection)
-    return probability_under(line, projection)
+        return probability_over(line, projection, confidence)
+    return probability_under(line, projection, confidence)
 
 
 def build_market_candidates(players: list, limit: int = 6) -> list:
@@ -2216,20 +2237,22 @@ def build_market_candidates(players: list, limit: int = 6) -> list:
             over_line = max(0.5, math.floor(projection) - 0.5)
             under_line = max(0.5, math.ceil(projection) + 0.5)
 
+            confidence = safe_number(
+                player.get("confidence")
+            ) or 50
+
             over_prob = model_probability_for_side(
                 over_line,
                 projection,
                 "over",
+                confidence,
             )
             under_prob = model_probability_for_side(
                 under_line,
                 projection,
                 "under",
+                confidence,
             )
-
-            confidence = safe_number(
-                player.get("confidence")
-            ) or 50
 
             best_side = (
                 "over" if over_prob >= under_prob
@@ -2303,6 +2326,7 @@ def build_market_candidates(players: list, limit: int = 6) -> list:
                 "reference_side": best_side,
                 "reference_line": round2(best_line),
                 "probability_fa": round2(best_prob),
+                "probability_model": "Poisson + confidence calibration",
                 "fa_rating": rating,
                 "raw_fa_rating": raw_rating,
                 "confidence": round2(confidence),
@@ -2386,12 +2410,18 @@ async def player_market_scan(
             "No representan cuotas ni líneas de bookmaker."
         ),
         "source": analysis.get("source"),
-        "motor": "Fútbol Analytics V2.2",
+        "motor": "Fútbol Analytics V2.2.3",
         "confidence_policy": {
             "alta": "85-100",
             "media": "70-84",
             "precaucion": "60-69",
             "no_publicar": "<60",
+        },
+        "probability_policy": {
+            "method": "Poisson + shrinkage toward 50% according to confidence",
+            "purpose": "reduce overconfidence from small historical samples",
+            "raw_probability": "conditional on the point projection",
+            "calibrated_probability": "reported probability used by the scanner",
         },
         "publication_policy": {
             "pick_recomendado": "confidence >= 70 + FA rating >= 80 + alineación confirmada + estadísticas disponibles",
@@ -2478,7 +2508,7 @@ def scanner(request: ScannerRequest):
             if edge > 0
             else "SIN VALOR POSITIVO"
         ),
-        "motor": "Fútbol Analytics V2.2",
+        "motor": "Fútbol Analytics V2.2.3",
     }
 
 
@@ -2569,7 +2599,7 @@ def scanner_projection(
             if edge > 0
             else "SIN VALOR POSITIVO"
         ),
-        "motor": "Fútbol Analytics V2.2",
+        "motor": "Fútbol Analytics V2.2.3",
     }
 
 
