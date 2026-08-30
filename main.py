@@ -1038,8 +1038,9 @@ async def get_recent_team_fixtures(
         ts = safe_number(fixture.get("starting_at_timestamp"))
         if before_timestamp and ts >= safe_number(before_timestamp):
             continue
-        if safe_number(fixture.get("season_id")) != safe_number(season_id):
-            continue
+        # Recent form must be chronological, not locked to the current
+        # season. At the start of a new season, the latest matches may belong
+        # to the previous Sportmonks season.
         if not fixture.get("lineups"):
             continue
         completed.append(fixture)
