@@ -174,6 +174,7 @@ def calculate_data_confidence(
     appearances: float,
     starts: float,
     starter: bool,
+    recent_matches: int = 0,
 ) -> int:
     """Return a sample-aware confidence score from 25 to 95.
 
@@ -183,6 +184,7 @@ def calculate_data_confidence(
     minutes = safe_number(minutes)
     appearances = safe_number(appearances)
     starts = safe_number(starts)
+    recent_matches = max(0, int(safe_number(recent_matches)))
 
     score = 40
     if starter:
@@ -213,7 +215,16 @@ def calculate_data_confidence(
         elif start_rate >= 0.50:
             score += 2
 
-    if minutes == 0 and appearances == 0:
+    # Recent form is additional evidence, but it cannot compensate fully
+    # for a tiny season sample. Keep the bonus deliberately capped.
+    if recent_matches >= 5:
+        score += 8
+    elif recent_matches >= 3:
+        score += 5
+    elif recent_matches >= 1:
+        score += 2
+
+    if minutes == 0 and appearances == 0 and recent_matches == 0:
         score -= 10
 
     return int(max(25, min(95, round(score))))
@@ -231,7 +242,8 @@ def confidence_band(confidence: float) -> str:
 
 
 def is_publishable_confidence(confidence: float) -> bool:
-    return safe_number(confidence) >= 60
+    # PRECAUCIÓN (60-69) is visible for review but is not a publishable pick.
+    return safe_number(confidence) >= 70
 
 
 def adjust_rating_for_data_quality(rating: float, confidence: float) -> int:
@@ -980,6 +992,44 @@ async def get_sportmonks_player_season(
     return result
 
 
+def fixture_is_completed(fixture: dict) -> bool:
+    """Return True only for completed fixtures when Sportmonks exposes state.
+
+    If a state is absent, existing lineups remain the fallback evidence that
+    the fixture was played; if a state is present, explicit non-finished
+    statuses are rejected.
+    """
+    state = fixture.get("state") or {}
+    if not isinstance(state, dict) or not state:
+        return bool(fixture.get("lineups"))
+
+    raw_values = [
+        state.get("short_name"),
+        state.get("name"),
+        state.get("state"),
+        state.get("developer_name"),
+    ]
+    values = {str(v).strip().lower() for v in raw_values if v is not None}
+    if not values:
+        return bool(fixture.get("lineups"))
+
+    finished = {
+        "ft", "finished", "aet", "pen", "after extra time",
+        "after penalties", "full time", "ended", "complete", "completed",
+    }
+    unfinished = {
+        "ns", "not started", "scheduled", "1h", "2h", "ht", "live",
+        "inplay", "postponed", "cancelled", "canceled", "abandoned",
+    }
+
+    if values & finished:
+        return True
+    if values & unfinished:
+        return False
+    # Unknown explicit state: require lineups rather than assuming completion.
+    return bool(fixture.get("lineups"))
+
+
 async def get_recent_team_fixtures(
     team_id: int,
     season_id: int,
@@ -1041,7 +1091,7 @@ async def get_recent_team_fixtures(
         # Recent form must be chronological, not locked to the current
         # season. At the start of a new season, the latest matches may belong
         # to the previous Sportmonks season.
-        if not fixture.get("lineups"):
+        if not fixture_is_completed(fixture):
             continue
         completed.append(fixture)
 
@@ -1861,6 +1911,26 @@ async def fixture_analysis_sportmonks(
                 for value in (recent_by_metric or {}).values()
             ] or [0]
         )
+        player["recent_form_minutes"] = safe_number(
+            ((player.get("recent_form") or {}).get("Remates") or {}).get("recent_minutes")
+        )
+        player["recent_form_weight"] = safe_number(
+            ((player.get("recent_form") or {}).get("Remates") or {}).get("recent_weight")
+        )
+        recent_matches = player["recent_form_matches"]
+        player["confidence"] = calculate_data_confidence(
+            minutes=player.get("minutes_season", 0),
+            appearances=player.get("appearances_season", 0),
+            starts=player.get("starts_season", 0),
+            starter=bool(player.get("starter")),
+            recent_matches=recent_matches,
+        )
+        player["recent_form_sample_quality"] = (
+            "SOLIDA" if recent_matches >= 5
+            else "MEDIA" if recent_matches >= 3
+            else "BAJA" if recent_matches >= 1
+            else "SIN MUESTRA"
+        )
         player["projection_method"] = (
             "temporada + forma reciente"
             if recent_by_metric
@@ -2141,6 +2211,9 @@ def build_market_candidates(players: list, limit: int = 6) -> list:
                     "season_minutes": round2(player.get("minutes_season")),
                     "season_appearances": round2(player.get("appearances_season")),
                     "recent_form_matches": player.get("recent_form_matches", 0),
+                    "recent_form_minutes": round2(player.get("recent_form_minutes")),
+                    "recent_form_weight": round2(player.get("recent_form_weight")),
+                    "recent_form_sample_quality": player.get("recent_form_sample_quality", "SIN MUESTRA"),
                     "recent_form_available": bool(player.get("recent_form_available")),
                     "method": player.get("projection_method", "temporada"),
                 },
