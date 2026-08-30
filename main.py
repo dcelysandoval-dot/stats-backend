@@ -174,7 +174,7 @@ def calculate_data_confidence(
     appearances: float,
     starts: float,
     starter: bool,
-    recent_matches: int = 0,
+    recent_matches: float = 0,
 ) -> int:
     """Return a sample-aware confidence score from 25 to 95.
 
@@ -184,7 +184,7 @@ def calculate_data_confidence(
     minutes = safe_number(minutes)
     appearances = safe_number(appearances)
     starts = safe_number(starts)
-    recent_matches = max(0, int(safe_number(recent_matches)))
+    recent_matches = safe_number(recent_matches)
 
     score = 40
     if starter:
@@ -215,16 +215,17 @@ def calculate_data_confidence(
         elif start_rate >= 0.50:
             score += 2
 
-    # Recent form is additional evidence, but it cannot compensate fully
-    # for a tiny season sample. Keep the bonus deliberately capped.
+    # Recent form adds evidence, but cannot compensate for an empty season sample.
+    # Cap the bonus so a player with only a few recent appearances does not
+    # become publishable solely because of recency.
     if recent_matches >= 5:
-        score += 8
+        score += 10
     elif recent_matches >= 3:
-        score += 5
+        score += 6
     elif recent_matches >= 1:
         score += 2
 
-    if minutes == 0 and appearances == 0 and recent_matches == 0:
+    if minutes == 0 and appearances == 0:
         score -= 10
 
     return int(max(25, min(95, round(score))))
@@ -242,7 +243,8 @@ def confidence_band(confidence: float) -> str:
 
 
 def is_publishable_confidence(confidence: float) -> bool:
-    # PRECAUCIÓN (60-69) is visible for review but is not a publishable pick.
+    # V2.2 publication threshold: confidence must be at least MEDIA (70).
+    # 60-69 remains visible for review but is never a publication candidate.
     return safe_number(confidence) >= 70
 
 
@@ -992,44 +994,6 @@ async def get_sportmonks_player_season(
     return result
 
 
-def fixture_is_completed(fixture: dict) -> bool:
-    """Return True only for completed fixtures when Sportmonks exposes state.
-
-    If a state is absent, existing lineups remain the fallback evidence that
-    the fixture was played; if a state is present, explicit non-finished
-    statuses are rejected.
-    """
-    state = fixture.get("state") or {}
-    if not isinstance(state, dict) or not state:
-        return bool(fixture.get("lineups"))
-
-    raw_values = [
-        state.get("short_name"),
-        state.get("name"),
-        state.get("state"),
-        state.get("developer_name"),
-    ]
-    values = {str(v).strip().lower() for v in raw_values if v is not None}
-    if not values:
-        return bool(fixture.get("lineups"))
-
-    finished = {
-        "ft", "finished", "aet", "pen", "after extra time",
-        "after penalties", "full time", "ended", "complete", "completed",
-    }
-    unfinished = {
-        "ns", "not started", "scheduled", "1h", "2h", "ht", "live",
-        "inplay", "postponed", "cancelled", "canceled", "abandoned",
-    }
-
-    if values & finished:
-        return True
-    if values & unfinished:
-        return False
-    # Unknown explicit state: require lineups rather than assuming completion.
-    return bool(fixture.get("lineups"))
-
-
 async def get_recent_team_fixtures(
     team_id: int,
     season_id: int,
@@ -1088,10 +1052,9 @@ async def get_recent_team_fixtures(
         ts = safe_number(fixture.get("starting_at_timestamp"))
         if before_timestamp and ts >= safe_number(before_timestamp):
             continue
-        # Recent form must be chronological, not locked to the current
-        # season. At the start of a new season, the latest matches may belong
-        # to the previous Sportmonks season.
-        if not fixture_is_completed(fixture):
+        if safe_number(fixture.get("season_id")) != safe_number(season_id):
+            continue
+        if not fixture.get("lineups"):
             continue
         completed.append(fixture)
 
@@ -1911,25 +1874,14 @@ async def fixture_analysis_sportmonks(
                 for value in (recent_by_metric or {}).values()
             ] or [0]
         )
-        player["recent_form_minutes"] = safe_number(
-            ((player.get("recent_form") or {}).get("Remates") or {}).get("recent_minutes")
-        )
-        player["recent_form_weight"] = safe_number(
-            ((player.get("recent_form") or {}).get("Remates") or {}).get("recent_weight")
-        )
-        recent_matches = player["recent_form_matches"]
+        # Recalculate confidence after the recent-form layer so the confidence
+        # score reflects both the season sample and the verified recent sample.
         player["confidence"] = calculate_data_confidence(
             minutes=player.get("minutes_season", 0),
             appearances=player.get("appearances_season", 0),
             starts=player.get("starts_season", 0),
             starter=bool(player.get("starter")),
-            recent_matches=recent_matches,
-        )
-        player["recent_form_sample_quality"] = (
-            "SOLIDA" if recent_matches >= 5
-            else "MEDIA" if recent_matches >= 3
-            else "BAJA" if recent_matches >= 1
-            else "SIN MUESTRA"
+            recent_matches=player.get("recent_form_matches", 0),
         )
         player["projection_method"] = (
             "temporada + forma reciente"
@@ -2188,19 +2140,22 @@ def build_market_candidates(players: list, limit: int = 6) -> list:
                 )
             )
 
-            # Keep medium-evidence opportunities visible for review, but
-            # never label them as publishable picks. This prevents the API
-            # from returning scanner_empty merely because every available
-            # player is in the 60-69 confidence band.
+            # Keep 60-69 visible as PRECAUCIÓN for review. Only confidence
+            # >=70 is publishable in V2.2. Candidates below 60 are excluded.
             if confidence < 60:
                 continue
+
+            publishable = (
+                is_publishable_confidence(confidence)
+                and bool(player.get("confirmed_lineup"))
+                and bool(player.get("stats_available"))
+            )
 
             rating = adjust_rating_for_data_quality(
                 raw_rating,
                 confidence,
             )
 
-            publishable = is_publishable_confidence(confidence)
             candidates.append({
                 "player_id": player.get("player_id"),
                 "player": player.get("player"),
@@ -2216,9 +2171,6 @@ def build_market_candidates(players: list, limit: int = 6) -> list:
                     "season_minutes": round2(player.get("minutes_season")),
                     "season_appearances": round2(player.get("appearances_season")),
                     "recent_form_matches": player.get("recent_form_matches", 0),
-                    "recent_form_minutes": round2(player.get("recent_form_minutes")),
-                    "recent_form_weight": round2(player.get("recent_form_weight")),
-                    "recent_form_sample_quality": player.get("recent_form_sample_quality", "SIN MUESTRA"),
                     "recent_form_available": bool(player.get("recent_form_available")),
                     "method": player.get("projection_method", "temporada"),
                 },
@@ -2278,14 +2230,6 @@ async def player_market_scan(
         analysis.get("players", []),
         limit=limit,
     )
-    publishable_candidates = [
-        candidate for candidate in candidates
-        if candidate.get("publishable")
-    ]
-    review_candidates = [
-        candidate for candidate in candidates
-        if candidate.get("confidence_band") == "PRECAUCIÓN"
-    ]
 
     return {
         "status": "scanner_ready" if candidates else "scanner_empty",
@@ -2295,8 +2239,13 @@ async def player_market_scan(
         "players_analyzed": len(analysis.get("players", [])),
         "players_with_stats": analysis.get("players_with_stats", 0),
         "players_with_projection": analysis.get("players_with_projection", 0),
-        "players_publishable": len(publishable_candidates),
-        "players_review": len(review_candidates),
+        "players_publishable": sum(
+            1 for candidate in candidates if candidate.get("publishable")
+        ),
+        "players_review": sum(
+            1 for candidate in candidates
+            if candidate.get("confidence_band") == "PRECAUCIÓN"
+        ),
         "candidates": candidates,
         "note": (
             "Las líneas mostradas son referencias matemáticas. "
@@ -2311,7 +2260,7 @@ async def player_market_scan(
             "no_publicar": "<60",
         },
         "publication_policy": {
-            "publishable": "confidence >= 70",
+            "publishable": "confidence >= 70 + alineación confirmada + estadísticas disponibles",
             "review_only": "60-69",
             "excluded": "<60",
         },
