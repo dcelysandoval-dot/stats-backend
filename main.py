@@ -14,8 +14,15 @@ from pydantic import BaseModel, Field
 # Sportmonks principal + API-Football fallback + autenticación V3 robusta
 # ============================================================
 
-APP_VERSION = "1.9.1"
-CURRENT_SEASON = int(os.getenv("CURRENT_SEASON", "2026"))
+APP_VERSION = "1.9.2"
+# Sportmonks uses numeric season IDs (e.g. 28083), while API-Football
+# uses calendar years (e.g. 2026). Keep them separate.
+CURRENT_SEASON_YEAR = int(os.getenv("CURRENT_SEASON_YEAR", os.getenv("CURRENT_SEASON", "2026")))
+SPORTMONKS_DEFAULT_SEASON_ID = int(
+    os.getenv("SPORTMONKS_DEFAULT_SEASON_ID", "28083")
+)
+# Backwards-compatible alias for any existing code that still imports it.
+CURRENT_SEASON = CURRENT_SEASON_YEAR
 
 app = FastAPI(
     title="Fútbol Analytics API",
@@ -86,6 +93,19 @@ def safe_number(value) -> float:
 
 def round2(value) -> float:
     return round(safe_number(value), 2)
+
+
+def api_football_season_year(season: Optional[int] = None) -> int:
+    """Return a calendar year suitable for API-Football."""
+    if season is None:
+        return CURRENT_SEASON_YEAR
+
+    # Sportmonks season IDs are large integers (e.g. 28083);
+    # API-Football expects a year such as 2026.
+    if season > 10000:
+        return CURRENT_SEASON_YEAR
+
+    return season
 
 
 def implied_probability(odds: float) -> float:
@@ -754,7 +774,7 @@ async def sportmonks_fixtures(
 async def apifootball_fixtures(
     date: Optional[str] = None,
     league: Optional[int] = None,
-    season: int = CURRENT_SEASON,
+    season: int = CURRENT_SEASON_YEAR,
     next: int = 100,
 ):
     params = {}
@@ -973,9 +993,11 @@ async def player_season(
     player_id: int,
     season: Optional[int] = None,
 ):
+    requested_season = season or SPORTMONKS_DEFAULT_SEASON_ID
+
     result = await get_sportmonks_player_season(
         player_id,
-        season,
+        requested_season,
     )
 
     if result["ok"]:
@@ -991,7 +1013,7 @@ async def player_season(
 
         return {
             "status": "ok",
-            "season": season,
+            "season": requested_season,
             "player": normalized,
             "source": "Sportmonks",
         }
@@ -1001,7 +1023,7 @@ async def player_season(
         "/players",
         {
             "id": player_id,
-            "season": season or CURRENT_SEASON,
+            "season": api_football_season_year(season),
         },
     )
 
@@ -1067,7 +1089,7 @@ async def player_season(
 
     return {
         "status": "ok",
-        "season": season or CURRENT_SEASON,
+        "season": api_football_season_year(season),
         "player": normalized,
         "source": "API-Football-fallback",
     }
@@ -1252,7 +1274,7 @@ async def fixture_analysis_sportmonks(
 @app.get("/api/fixture-analysis")
 async def fixture_analysis(
     fixture_id: int,
-    season: int = CURRENT_SEASON,
+    season: Optional[int] = None,
 ):
     primary, error = await fixture_analysis_sportmonks(
         fixture_id,
@@ -1357,7 +1379,7 @@ async def fixture_analysis(
         "status": "lineups_only",
         "available": True,
         "fixture_id": fixture_id,
-        "season": season,
+        "season": api_football_season_year(season),
         "fixture": {
             "date": fixture.get("date"),
             "status": fixture.get("status"),
@@ -1490,7 +1512,7 @@ def build_market_candidates(players: list, limit: int = 6) -> list:
 @app.get("/api/player-market-scan")
 async def player_market_scan(
     fixture_id: int,
-    season: int = CURRENT_SEASON,
+    season: int = SPORTMONKS_DEFAULT_SEASON_ID,
     limit: int = 6,
 ):
     analysis = await fixture_analysis(
