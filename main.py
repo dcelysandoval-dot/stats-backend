@@ -10,11 +10,11 @@ from pydantic import BaseModel, Field
 
 
 # ============================================================
-# FÚTBOL ANALYTICS - BACKEND V1.9
+# FÚTBOL ANALYTICS - BACKEND V2.2
 # Sportmonks principal + API-Football fallback + autenticación V3 robusta
 # ============================================================
 
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.2.0"
 # Sportmonks uses numeric season IDs (e.g. 28083), while API-Football
 # uses calendar years (e.g. 2026). Keep them separate.
 CURRENT_SEASON_YEAR = int(os.getenv("CURRENT_SEASON_YEAR", os.getenv("CURRENT_SEASON", "2026")))
@@ -148,6 +148,102 @@ def signal_from_edge(edge: float) -> str:
     if edge > 0:
         return "VALOR BAJO"
     return "SIN VALOR"
+
+
+def classify_data_quality(minutes: float, appearances: float):
+    """Classify historical sample size using both minutes and appearances."""
+    minutes = safe_number(minutes)
+    appearances = safe_number(appearances)
+
+    if minutes >= 900 and appearances >= 10:
+        return "ALTA", f"Muestra sólida: {int(appearances)} apariciones / {int(minutes)} min"
+    if minutes >= 450 and appearances >= 5:
+        return "MEDIA", f"Muestra intermedia: {int(appearances)} apariciones / {int(minutes)} min"
+    if minutes > 0 or appearances > 0:
+        return "BAJA", f"Muestra inicial: {int(appearances)} apariciones / {int(minutes)} min"
+    return "BAJA", "Sin minutos registrados en la temporada"
+
+
+def calculate_data_confidence(
+    minutes: float,
+    appearances: float,
+    starts: float,
+    starter: bool,
+) -> int:
+    """Return a sample-aware confidence score from 25 to 95.
+
+    The score is deliberately separate from probability/rating. A confirmed
+    starter can still have low confidence when the historical sample is tiny.
+    """
+    minutes = safe_number(minutes)
+    appearances = safe_number(appearances)
+    starts = safe_number(starts)
+
+    score = 40
+    if starter:
+        score += 10
+
+    if appearances >= 10:
+        score += 22
+    elif appearances >= 6:
+        score += 15
+    elif appearances >= 3:
+        score += 9
+    elif appearances >= 1:
+        score += 4
+
+    if minutes >= 900:
+        score += 18
+    elif minutes >= 450:
+        score += 12
+    elif minutes >= 180:
+        score += 6
+    elif minutes > 0:
+        score += 3
+
+    if appearances > 0:
+        start_rate = starts / appearances
+        if start_rate >= 0.75:
+            score += 4
+        elif start_rate >= 0.50:
+            score += 2
+
+    if minutes == 0 and appearances == 0:
+        score -= 10
+
+    return int(max(25, min(95, round(score))))
+
+
+def confidence_band(confidence: float) -> str:
+    confidence = safe_number(confidence)
+    if confidence >= 85:
+        return "ALTA"
+    if confidence >= 70:
+        return "MEDIA"
+    if confidence >= 60:
+        return "PRECAUCIÓN"
+    return "NO PUBLICAR"
+
+
+def is_publishable_confidence(confidence: float) -> bool:
+    return safe_number(confidence) >= 60
+
+
+def adjust_rating_for_data_quality(rating: float, confidence: float) -> int:
+    """Penalize the final rating when the historical sample is weak."""
+    rating = safe_number(rating)
+    confidence = safe_number(confidence)
+
+    if confidence >= 85:
+        multiplier = 1.00
+    elif confidence >= 70:
+        multiplier = 0.92
+    elif confidence >= 60:
+        multiplier = 0.80
+    else:
+        multiplier = 0.60
+
+    return int(round(max(0, min(100, rating * multiplier))))
 
 
 def calculate_stake(bankroll: float, stake_percent: float) -> float:
@@ -1392,40 +1488,17 @@ async def fixture_analysis_sportmonks(
                 )
             )
 
-            data_quality = (
-                "ALTA" if minutes >= 900 and appearances >= 10
-                else "MEDIA" if minutes >= 450 and appearances >= 5
-                else "BAJA"
+            data_quality, data_quality_reason = classify_data_quality(
+                minutes,
+                appearances,
             )
 
-            if data_quality == "ALTA":
-                data_quality_reason = f"Muestra sólida: {int(appearances)} apariciones / {int(minutes)} min"
-            elif data_quality == "MEDIA":
-                data_quality_reason = f"Muestra intermedia: {int(appearances)} apariciones / {int(minutes)} min"
-            elif minutes > 0:
-                data_quality_reason = f"Muestra inicial: {int(appearances)} apariciones / {int(minutes)} min"
-            else:
-                data_quality_reason = "Sin minutos registrados en la temporada"
-
-            # Confidence now reflects both the confirmed lineup and the
-            # amount of historical sample, instead of giving every starter
-            # the same confidence score.
-            confidence = 72 if starter else 48
-            if minutes >= 900 and appearances >= 10:
-                confidence += 10
-            elif minutes >= 450 and appearances >= 5:
-                confidence += 6
-            elif minutes >= 180 and appearances >= 2:
-                confidence += 3
-            elif minutes == 0:
-                confidence -= 18
-
-            if appearances <= 2 and minutes > 0:
-                confidence -= 8
-            elif appearances <= 4 and minutes > 0:
-                confidence -= 4
-
-            confidence = max(25, min(95, confidence))
+            confidence = calculate_data_confidence(
+                minutes=minutes,
+                appearances=appearances,
+                starts=starts,
+                starter=starter,
+            )
 
             players.append({
                 "player_id": pid,
@@ -1506,7 +1579,7 @@ async def fixture_analysis_sportmonks(
             "minutos esperados; no incluyen cuotas de bookmaker."
         ),
         "source": "Sportmonks",
-        "motor": "Fútbol Analytics V2.1",
+        "motor": "Fútbol Analytics V2.2",
     }, None
 
 
@@ -1639,7 +1712,7 @@ async def fixture_analysis(
         "players": players,
         "markets": SUPPORTED_MARKETS,
         "source": "API-Football-fallback",
-        "motor": "Fútbol Analytics V2.1",
+        "motor": "Fútbol Analytics V2.2",
     }
 
 
@@ -1712,7 +1785,7 @@ def build_market_candidates(players: list, limit: int = 6) -> list:
             )
             best_prob = max(over_prob, under_prob)
 
-            rating = round(
+            raw_rating = round(
                 max(
                     0,
                     min(
@@ -1722,6 +1795,14 @@ def build_market_candidates(players: list, limit: int = 6) -> list:
                         + 10,
                     ),
                 )
+            )
+
+            if not is_publishable_confidence(confidence):
+                continue
+
+            rating = adjust_rating_for_data_quality(
+                raw_rating,
+                confidence,
             )
 
             candidates.append({
@@ -1742,7 +1823,10 @@ def build_market_candidates(players: list, limit: int = 6) -> list:
                 "reference_line": round2(best_line),
                 "probability_fa": round2(best_prob),
                 "fa_rating": rating,
+                "raw_fa_rating": raw_rating,
                 "confidence": round2(confidence),
+                "confidence_band": confidence_band(confidence),
+                "publishable": is_publishable_confidence(confidence),
                 "data_quality": player.get(
                     "data_quality",
                     "BAJA",
@@ -1795,13 +1879,20 @@ async def player_market_scan(
         "players_analyzed": len(analysis.get("players", [])),
         "players_with_stats": analysis.get("players_with_stats", 0),
         "players_with_projection": analysis.get("players_with_projection", 0),
+        "players_publishable": len(candidates),
         "candidates": candidates,
         "note": (
             "Las líneas mostradas son referencias matemáticas. "
             "No representan cuotas ni líneas de bookmaker."
         ),
         "source": analysis.get("source"),
-        "motor": "Fútbol Analytics V2.1",
+        "motor": "Fútbol Analytics V2.2",
+        "confidence_policy": {
+            "alta": "85-100",
+            "media": "70-84",
+            "precaucion": "60-69",
+            "no_publicar": "<60",
+        },
     }
 
 
@@ -1881,7 +1972,7 @@ def scanner(request: ScannerRequest):
             if edge > 0
             else "SIN VALOR POSITIVO"
         ),
-        "motor": "Fútbol Analytics V2.1",
+        "motor": "Fútbol Analytics V2.2",
     }
 
 
@@ -1972,7 +2063,7 @@ def scanner_projection(
             if edge > 0
             else "SIN VALOR POSITIVO"
         ),
-        "motor": "Fútbol Analytics V2.1",
+        "motor": "Fútbol Analytics V2.2",
     }
 
 
