@@ -266,6 +266,35 @@ def is_publishable_candidate(
     )
 
 
+def classify_recommendation(
+    confidence: float,
+    rating: float,
+    confirmed_lineup: bool,
+    stats_available: bool,
+) -> str:
+    """Separate technical publication from the stronger recommended pick tier."""
+    confidence = safe_number(confidence)
+    rating = safe_number(rating)
+
+    if (
+        confidence >= 70
+        and rating >= 80
+        and bool(confirmed_lineup)
+        and bool(stats_available)
+    ):
+        return "PICK_RECOMENDADO"
+
+    if (
+        confidence >= 60
+        and rating >= 70
+        and bool(confirmed_lineup)
+        and bool(stats_available)
+    ):
+        return "PUBLICABLE"
+
+    return "REVISION"
+
+
 def adjust_rating_for_data_quality(rating: float, confidence: float) -> int:
     """Penalize the final rating when the historical sample is weak."""
     rating = safe_number(rating)
@@ -2228,6 +2257,12 @@ def build_market_candidates(players: list, limit: int = 6) -> list:
                 confirmed_lineup=confirmed_lineup,
                 stats_available=stats_available,
             )
+            recommendation = classify_recommendation(
+                confidence=confidence,
+                rating=rating,
+                confirmed_lineup=confirmed_lineup,
+                stats_available=stats_available,
+            )
             candidates.append({
                 "player_id": player.get("player_id"),
                 "player": player.get("player"),
@@ -2257,6 +2292,7 @@ def build_market_candidates(players: list, limit: int = 6) -> list:
                 "confidence": round2(confidence),
                 "confidence_band": confidence_band(confidence),
                 "publishable": publishable,
+                "recommendation": recommendation,
                 "data_quality": player.get(
                     "data_quality",
                     "BAJA",
@@ -2308,6 +2344,10 @@ async def player_market_scan(
         candidate for candidate in candidates
         if candidate.get("publishable")
     ]
+    recommended_candidates = [
+        candidate for candidate in candidates
+        if candidate.get("recommendation") == "PICK_RECOMENDADO"
+    ]
     review_candidates = [
         candidate for candidate in candidates
         if candidate.get("confidence_band") == "PRECAUCIÓN"
@@ -2322,6 +2362,7 @@ async def player_market_scan(
         "players_with_stats": analysis.get("players_with_stats", 0),
         "players_with_projection": analysis.get("players_with_projection", 0),
         "players_publishable": len(publishable_candidates),
+        "players_recommended": len(recommended_candidates),
         "players_review": len(review_candidates),
         "candidates": candidates,
         "note": (
@@ -2337,6 +2378,7 @@ async def player_market_scan(
             "no_publicar": "<60",
         },
         "publication_policy": {
+            "pick_recomendado": "confidence >= 70 + FA rating >= 80 + alineación confirmada + estadísticas disponibles",
             "publishable": "confidence >= 60 + FA rating >= 70 + alineación confirmada + estadísticas disponibles",
             "review_only": "confidence 60-69 con FA rating < 70 o datos requeridos incompletos",
             "excluded": "confidence < 60",
