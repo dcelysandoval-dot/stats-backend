@@ -1008,23 +1008,31 @@ async def get_recent_team_fixtures(
     if cached and now - cached["timestamp"] < RECENT_FORM_CACHE_TTL:
         return list(cached["fixtures"])
 
+    # Sportmonks V3 team date-range endpoint is:
+    # /football/fixtures/between/{start_date}/{end_date}/{team_id}
+    # (there is NO /date/ segment on this endpoint).
     endpoint = (
-        f"/football/fixtures/between/date/"
+        f"/football/fixtures/between/"
         f"{start_dt.date().isoformat()}/"
         f"{end_dt.date().isoformat()}/"
         f"{int(team_id)}"
     )
     params = {
-        "include": "lineups.details",
+        # Include team metadata plus per-player match details.
+        "include": "participants;state;lineups.details.type",
         "order": "desc",
-        "per_page": max(RECENT_FORM_MATCHES * 2, 12),
+        "per_page": min(max(RECENT_FORM_MATCHES * 2, 12), 50),
     }
 
     result = await sportmonks_get(endpoint, params)
     if not result.get("ok"):
         return []
 
-    fixtures = (result.get("data") or {}).get("data") or []
+    payload = result.get("data") or {}
+    fixtures = payload.get("data") or [] if isinstance(payload, dict) else []
+    if isinstance(fixtures, dict):
+        fixtures = [fixtures]
+
     completed = []
     for fixture in fixtures:
         ts = safe_number(fixture.get("starting_at_timestamp"))
