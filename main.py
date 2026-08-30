@@ -423,7 +423,31 @@ def parse_sportmonks_statistics(statistics) -> dict:
             if key:
                 totals[key] += stat_value(detail)
 
-    return {key: round2(value) for key, value in totals.items()}
+    normalized = {key: round2(value) for key, value in totals.items()}
+
+    # Las proyecciones del Player Market Scanner usan métricas por 90.
+    # parse_sportmonks_statistics() debe entregarlas directamente porque
+    # collect_sportmonks_player_stats() consume este resultado sin pasar
+    # por normalize_player_from_sportmonks().
+    minutes = safe_number(normalized.get("minutes"))
+
+    def per90(value) -> float:
+        if minutes <= 0:
+            return 0.0
+        return round2(safe_number(value) / minutes * 90.0)
+
+    normalized.update({
+        "shots_per90": per90(normalized.get("shots", 0)),
+        "shots_on_target_per90": per90(normalized.get("shots_on_target", 0)),
+        "goals_per90": per90(normalized.get("goals", 0)),
+        "assists_per90": per90(normalized.get("assists", 0)),
+        "fouls_committed_per90": per90(normalized.get("fouls_committed", 0)),
+        "fouls_drawn_per90": per90(normalized.get("fouls_drawn", 0)),
+        "yellow_cards_per90": per90(normalized.get("yellow_cards", 0)),
+        "key_passes_per90": per90(normalized.get("key_passes", 0)),
+    })
+
+    return normalized
 
 
 def normalize_sportmonks_participant(participant: dict) -> dict:
