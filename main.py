@@ -11,11 +11,11 @@ from pydantic import BaseModel, Field
 
 
 # ============================================================
-# FÚTBOL ANALYTICS - BACKEND V2.2.4
+# FÚTBOL ANALYTICS - BACKEND V2.2.5
 # Sportmonks principal + API-Football fallback + autenticación V3 robusta
 # ============================================================
 
-APP_VERSION = "2.2.4"
+APP_VERSION = "2.2.5"
 # Sportmonks uses numeric season IDs (e.g. 28083), while API-Football
 # uses calendar years (e.g. 2026). Keep them separate.
 CURRENT_SEASON_YEAR = int(os.getenv("CURRENT_SEASON_YEAR", os.getenv("CURRENT_SEASON", "2026")))
@@ -261,23 +261,48 @@ def is_publishable_confidence(confidence: float) -> bool:
     return safe_number(confidence) >= 70
 
 
+def is_sample_sufficient_for_recommendation(player: dict) -> bool:
+    """Return whether season data or recent form provides enough evidence.
+
+    A new season can have a tiny current-season sample even for established
+    players. We therefore accept either a MEDIA/ALTA season sample or a
+    genuinely solid recent-form window (at least 5 matches and 360 minutes).
+    """
+    player = player or {}
+    season_quality, _ = classify_data_quality(
+        player.get("minutes_season", 0),
+        player.get("appearances_season", 0),
+    )
+    if season_quality in {"MEDIA", "ALTA"}:
+        return True
+
+    recent_matches = int(safe_number(player.get("recent_form_matches", 0)))
+    recent_minutes = safe_number(player.get("recent_form_minutes", 0))
+    recent_quality = str(
+        player.get("recent_form_sample_quality", "")
+    ).strip().upper()
+
+    return (
+        recent_matches >= 5
+        and recent_minutes >= 360
+        and recent_quality in {"SOLIDA", "SÓLIDA"}
+    )
+
+
 def is_publishable_candidate(
     confidence: float,
     rating: float,
     confirmed_lineup: bool,
     stats_available: bool,
+    sample_sufficient: bool = False,
 ) -> bool:
-    """Gate publication without weakening the underlying model.
-
-    Candidates below 70 confidence remain review-only, even when the
-    FA rating is high. This prevents a small historical sample from being
-    promoted to a publishable pick.
-    """
+    """Gate publication using model quality and evidence quality."""
     return (
         safe_number(confidence) >= 70
         and safe_number(rating) >= 70
         and bool(confirmed_lineup)
         and bool(stats_available)
+        and bool(sample_sufficient)
     )
 
 
@@ -286,17 +311,11 @@ def classify_recommendation(
     rating: float,
     confirmed_lineup: bool,
     stats_available: bool,
-    data_quality: str = "BAJA",
+    sample_sufficient: bool = False,
 ) -> str:
-    """Classify a candidate while preventing weak samples from becoming strong picks.
-
-    A strong recommendation requires at least a medium historical sample.
-    Candidates with strong model numbers but a low historical sample remain
-    visible as PICK_PRECAUCION instead of being promoted to PICK_RECOMENDADO.
-    """
+    """Classify recommendations while preserving a caution tier."""
     confidence = safe_number(confidence)
     rating = safe_number(rating)
-    quality = str(data_quality or "BAJA").strip().upper()
 
     if (
         confidence >= 70
@@ -304,9 +323,7 @@ def classify_recommendation(
         and bool(confirmed_lineup)
         and bool(stats_available)
     ):
-        if quality in {"ALTA", "MEDIA"}:
-            return "PICK_RECOMENDADO"
-        return "PICK_PRECAUCION"
+        return "PICK_RECOMENDADO" if sample_sufficient else "PICK_PRECAUCION"
 
     if (
         confidence >= 70
@@ -314,9 +331,7 @@ def classify_recommendation(
         and bool(confirmed_lineup)
         and bool(stats_available)
     ):
-        if quality == "BAJA":
-            return "PICK_PRECAUCION"
-        return "PUBLICABLE"
+        return "PUBLICABLE" if sample_sufficient else "PICK_PRECAUCION"
 
     return "REVISION"
 
@@ -2066,7 +2081,7 @@ async def fixture_analysis_sportmonks(
             "minutos esperados; no incluyen cuotas de bookmaker."
         ),
         "source": "Sportmonks",
-        "motor": "Fútbol Analytics V2.2.4",
+        "motor": "Fútbol Analytics V2.2.5",
     }, None
 
 
@@ -2199,7 +2214,7 @@ async def fixture_analysis(
         "players": players,
         "markets": SUPPORTED_MARKETS,
         "source": "API-Football-fallback",
-        "motor": "Fútbol Analytics V2.2.4",
+        "motor": "Fútbol Analytics V2.2.5",
     }
 
 
@@ -2301,19 +2316,20 @@ def build_market_candidates(players: list, limit: int = 6) -> list:
 
             confirmed_lineup = bool(player.get("confirmed_lineup"))
             stats_available = bool(player.get("stats_available"))
+            sample_sufficient = is_sample_sufficient_for_recommendation(player)
             publishable = is_publishable_candidate(
                 confidence=confidence,
                 rating=rating,
                 confirmed_lineup=confirmed_lineup,
                 stats_available=stats_available,
+                sample_sufficient=sample_sufficient,
             )
-            data_quality = str(player.get("data_quality", "BAJA") or "BAJA").upper()
             recommendation = classify_recommendation(
                 confidence=confidence,
                 rating=rating,
                 confirmed_lineup=confirmed_lineup,
                 stats_available=stats_available,
-                data_quality=data_quality,
+                sample_sufficient=sample_sufficient,
             )
             candidates.append({
                 "player_id": player.get("player_id"),
@@ -2346,10 +2362,26 @@ def build_market_candidates(players: list, limit: int = 6) -> list:
                 "confidence_band": confidence_band(confidence),
                 "publishable": publishable,
                 "recommendation": recommendation,
-                "data_quality": data_quality,
+                "data_quality": player.get(
+                    "data_quality",
+                    "BAJA",
+                ),
                 "data_quality_reason": player.get(
                     "data_quality_reason",
                     "No disponible",
+                ),
+                "sample_sufficient_for_recommendation": sample_sufficient,
+                "sample_quality_basis": (
+                    "temporada_media_alta"
+                    if classify_data_quality(
+                        player.get("minutes_season", 0),
+                        player.get("appearances_season", 0),
+                    )[0] in {"MEDIA", "ALTA"}
+                    else (
+                        "forma_reciente_solida"
+                        if sample_sufficient
+                        else "muestra_insuficiente"
+                    )
                 ),
                 "projection_method": player.get(
                     "projection_method",
@@ -2398,13 +2430,14 @@ async def player_market_scan(
         candidate for candidate in candidates
         if candidate.get("recommendation") == "PICK_RECOMENDADO"
     ]
-    caution_candidates = [
+    precaution_candidates = [
         candidate for candidate in candidates
         if candidate.get("recommendation") == "PICK_PRECAUCION"
     ]
     review_candidates = [
         candidate for candidate in candidates
         if candidate.get("confidence_band") == "PRECAUCIÓN"
+        or candidate.get("recommendation") == "PICK_PRECAUCION"
     ]
 
     return {
@@ -2417,15 +2450,15 @@ async def player_market_scan(
         "players_with_projection": analysis.get("players_with_projection", 0),
         "players_publishable": len(publishable_candidates),
         "players_recommended": len(recommended_candidates),
-        "players_caution": len(caution_candidates),
         "players_review": len(review_candidates),
+        "players_precaution": len(precaution_candidates),
         "candidates": candidates,
         "note": (
             "Las líneas mostradas son referencias matemáticas. "
             "No representan cuotas ni líneas de bookmaker."
         ),
         "source": analysis.get("source"),
-        "motor": "Fútbol Analytics V2.2.4",
+        "motor": "Fútbol Analytics V2.2.5",
         "confidence_policy": {
             "alta": "85-100",
             "media": "70-84",
@@ -2439,10 +2472,11 @@ async def player_market_scan(
             "calibrated_probability": "reported probability used by the scanner",
         },
         "publication_policy": {
-            "pick_recomendado": "confidence >= 70 + FA rating >= 80 + alineación confirmada + estadísticas disponibles + data_quality MEDIA/ALTA",
-            "pick_precaucion": "confidence >= 70 + FA rating >= 70, pero data_quality BAJA",
-            "publishable": "confidence >= 70 + FA rating >= 70 + alineación confirmada + estadísticas disponibles + data_quality MEDIA/ALTA",
-            "review_only": "confidence 60-69, data_quality BAJA o datos requeridos incompletos",
+            "pick_recomendado": "confidence >= 70 + FA rating >= 80 + alineación confirmada + estadísticas disponibles + muestra suficiente",
+            "publishable": "confidence >= 70 + FA rating >= 70 + alineación confirmada + estadísticas disponibles + muestra suficiente",
+            "pick_precaucion": "buenos scores pero muestra insuficiente; no se trata como pick fuerte",
+            "sample_gate": "temporada MEDIA/ALTA o forma reciente SOLIDA (>=5 partidos y >=360 min)",
+            "review_only": "confidence 60-69, muestra insuficiente o datos requeridos incompletos",
             "excluded": "confidence < 60",
         },
     }
@@ -2524,7 +2558,7 @@ def scanner(request: ScannerRequest):
             if edge > 0
             else "SIN VALOR POSITIVO"
         ),
-        "motor": "Fútbol Analytics V2.2.4",
+        "motor": "Fútbol Analytics V2.2.5",
     }
 
 
@@ -2615,7 +2649,7 @@ def scanner_projection(
             if edge > 0
             else "SIN VALOR POSITIVO"
         ),
-        "motor": "Fútbol Analytics V2.2.4",
+        "motor": "Fútbol Analytics V2.2.5",
     }
 
 
