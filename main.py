@@ -12,8 +12,8 @@ from pydantic import BaseModel, Field
 
 
 # ============================================================
-# FÚTBOL ANALYTICS - BACKEND V2.2.6
-# Sportmonks principal + API-Football fallback + autenticación V3 robusta
+# FÚTBOL ANALYTICS - BACKEND V2.2.7
+# Sportmonks principal + API-Football separado + autenticación V3 robusta
 #
 # Cambios respecto a V2.2.5 (revisión de código):
 #   1. collect_sportmonks_player_stats ahora se llama en paralelo
@@ -45,7 +45,7 @@ from pydantic import BaseModel, Field
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("futbol_analytics")
 
-APP_VERSION = "2.2.6"
+APP_VERSION = "2.2.7"
 # Sportmonks uses numeric season IDs (e.g. 28083), while API-Football
 # uses calendar years (e.g. 2026). Keep them separate.
 CURRENT_SEASON_YEAR = int(os.getenv("CURRENT_SEASON_YEAR", os.getenv("CURRENT_SEASON", "2026")))
@@ -1718,46 +1718,18 @@ async def fixture_detail(fixture_id: int):
             "source": "Sportmonks",
         }
 
-    # Fallback
-    fallback = await apifootball_get(
-        "/fixtures",
-        {"id": fixture_id},
-    )
-
-    if not fallback["ok"]:
-        return {
-            "status": "error",
-            "fixture_id": fixture_id,
-            "message": result["error"],
-            "details": result["data"],
-            "fallback": fallback["error"],
-        }
-
-    response = fallback["data"].get("response", [])
-    if not response:
-        return {
-            "status": "not_found",
-            "fixture_id": fixture_id,
-            "message": "Fixture no encontrado.",
-        }
-
-    item = response[0]
-    fixture = item.get("fixture") or {}
-    teams = item.get("teams") or {}
-    league = item.get("league") or {}
-
+    # IMPORTANT: fixture_id is a Sportmonks ID in this endpoint.
+    # Never send it to API-Football, whose fixture IDs use a different namespace.
     return {
-        "status": "ok",
-        "fixture": {
-            "fixture_id": fixture.get("id"),
-            "date": fixture.get("date"),
-            "timestamp": fixture.get("timestamp"),
-            "status": fixture.get("status"),
-            "league": league,
-            "home": teams.get("home"),
-            "away": teams.get("away"),
-        },
-        "source": "API-Football-fallback",
+        "status": "error",
+        "fixture_id": fixture_id,
+        "message": (
+            "Fixture no disponible desde Sportmonks. "
+            "No se usará el mismo fixture_id como ID de API-Football."
+        ),
+        "details": result.get("data"),
+        "source": "Sportmonks",
+        "fallback": "disabled_for_id_safety",
     }
 
 
@@ -1783,79 +1755,21 @@ async def fixture_lineups(fixture_id: int):
                 "source": "Sportmonks",
             }
 
-    # Fallback
-    fallback = await apifootball_get(
-        "/fixtures/lineups",
-        {"fixture": fixture_id},
-    )
-
-    if not fallback["ok"]:
-        return {
-            "status": "lineups_pending",
-            "fixture_id": fixture_id,
-            "available": False,
-            "lineups": [],
-            "message": result["error"],
-            "fallback": fallback["error"],
-        }
-
-    response = fallback["data"].get("response", [])
-
-    if not response:
-        return {
-            "status": "lineups_pending",
-            "fixture_id": fixture_id,
-            "available": False,
-            "lineups": [],
-            "message": "Las alineaciones todavía no están disponibles.",
-        }
-
-    lineups = []
-
-    for block in response:
-        team = block.get("team") or {}
-        coach = block.get("coach") or {}
-
-        starters = []
-        substitutes = []
-
-        for entry in block.get("startXI", []) or []:
-            player = entry.get("player") or {}
-            starters.append({
-                "player_id": player.get("id"),
-                "name": player.get("name"),
-                "number": player.get("number"),
-                "position": player.get("pos"),
-                "starter": True,
-            })
-
-        for entry in block.get("substitutes", []) or []:
-            player = entry.get("player") or {}
-            substitutes.append({
-                "player_id": player.get("id"),
-                "name": player.get("name"),
-                "number": player.get("number"),
-                "position": player.get("pos"),
-                "starter": False,
-            })
-
-        lineups.append({
-            "team": team,
-            "coach": coach,
-            "formation": block.get("formation"),
-            "starters": starters,
-            "substitutes": substitutes,
-            "starter_count": len(starters),
-            "substitute_count": len(substitutes),
-        })
-
+    # IMPORTANT: fixture_id is a Sportmonks ID in this endpoint.
+    # Never send it to API-Football, whose fixture IDs use a different namespace.
     return {
-        "status": "confirmed_lineups",
-        "available": True,
+        "status": "lineups_pending",
         "fixture_id": fixture_id,
-        "count": len(lineups),
-        "lineups": lineups,
-        "source": "API-Football-fallback",
+        "available": False,
+        "lineups": [],
+        "message": (
+            (result or {}).get("error")
+            if isinstance(result, dict)
+            else "No fue posible obtener las alineaciones desde Sportmonks."
+        ),
+        "details": (result or {}).get("data") if isinstance(result, dict) else None,
+        "source": "Sportmonks",
+        "fallback": "disabled_for_id_safety",
     }
 
 
@@ -2261,7 +2175,7 @@ async def fixture_analysis_sportmonks(
 
 
 # ============================================================
-# FIXTURE ANALYSIS - FALLBACK API FOOTBALL
+# FIXTURE ANALYSIS - SPORTMONKS ONLY (ID-safe)
 # ============================================================
 
 @app.get("/api/fixture-analysis")
@@ -2279,117 +2193,19 @@ async def fixture_analysis(
     if primary is not None and primary.get("available"):
         return primary
 
-    # Si Sportmonks falla, usamos API-Football como respaldo.
-    fixture_result = await apifootball_get(
-        "/fixtures",
-        {"id": fixture_id},
-    )
-
-    if not fixture_result["ok"]:
-        return {
-            "status": "error",
-            "fixture_id": fixture_id,
-            "message": error["error"] if error else "Error",
-            "details": error["data"] if error else None,
-            "fallback": fixture_result["error"],
-        }
-
-    fixtures = fixture_result["data"].get("response", [])
-
-    if not fixtures:
-        return {
-            "status": "not_found",
-            "fixture_id": fixture_id,
-            "message": "Fixture no encontrado.",
-        }
-
-    item = fixtures[0]
-    fixture = item.get("fixture") or {}
-    teams = item.get("teams") or {}
-    league = item.get("league") or {}
-
-    lineup_result = await apifootball_get(
-        "/fixtures/lineups",
-        {"fixture": fixture_id},
-    )
-
-    if not lineup_result["ok"]:
-        return {
-            "status": "lineups_pending",
-            "available": False,
-            "fixture_id": fixture_id,
-            "players": [],
-            "message": "No fue posible obtener las alineaciones.",
-            "details": lineup_result["data"],
-        }
-
-    lineup_response = lineup_result["data"].get("response", [])
-
-    if not lineup_response:
-        return {
-            "status": "lineups_pending",
-            "available": False,
-            "fixture_id": fixture_id,
-            "players": [],
-            "message": "Las alineaciones todavía no están disponibles.",
-        }
-
-    players = []
-
-    for block in lineup_response:
-        team = block.get("team") or {}
-
-        for entry in (
-            list(block.get("startXI", []) or [])
-            + list(block.get("substitutes", []) or [])
-        ):
-            p = entry.get("player") or {}
-            pid = p.get("id")
-            if not pid:
-                continue
-
-            starter = entry in (block.get("startXI", []) or [])
-
-            # Fallback conserva el formato V1.9, pero sin hacer
-            # múltiples llamadas innecesarias por jugador.
-            players.append({
-                "player_id": pid,
-                "player": p.get("name"),
-                "team": team.get("name"),
-                "team_id": team.get("id"),
-                "number": p.get("number"),
-                "position": p.get("pos"),
-                "starter": starter,
-                "confirmed_lineup": True,
-                "expected_minutes": 75 if starter else 20,
-                "stats_available": False,
-                "data_quality": "BAJA",
-                "confidence": 55 if starter else 35,
-                "projection": {
-                    market: 0.0 for market in SUPPORTED_MARKETS
-                },
-            })
-
+    # The fixture_id accepted here is a Sportmonks ID.
+    # Never reuse it as an API-Football ID.
     return {
-        "status": "lineups_only",
-        "available": True,
+        "status": "error",
         "fixture_id": fixture_id,
-        "season": api_football_season_year(season),
-        "fixture": {
-            "date": fixture.get("date"),
-            "status": fixture.get("status"),
-            "league": league,
-            "home": teams.get("home"),
-            "away": teams.get("away"),
-        },
-        "lineups_confirmed": True,
-        "count": len(players),
-        "starter_count": sum(1 for p in players if p["starter"]),
-        "substitute_count": sum(1 for p in players if not p["starter"]),
-        "players": players,
-        "markets": SUPPORTED_MARKETS,
-        "source": "API-Football-fallback",
-        "motor": "Fútbol Analytics V2.2.6",
+        "message": (
+            (error or {}).get("error")
+            if isinstance(error, dict)
+            else "Fixture no disponible desde Sportmonks."
+        ),
+        "details": (error or {}).get("data") if isinstance(error, dict) else None,
+        "source": "Sportmonks",
+        "fallback": "disabled_for_id_safety",
     }
 
 
