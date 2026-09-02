@@ -518,6 +518,64 @@ async def sportmonks_get(
 
 
 # ============================================================
+# DIAGNÓSTICO SPORTMONKS
+# ============================================================
+
+@app.get("/api/diagnostico-sportmonks-fixture")
+async def diagnostico_sportmonks_fixture(fixture_id: int):
+    """Diagnose which fixture resource/include is rejected upstream.
+
+    This endpoint does not expose the API token or raw fixture payload.
+    It performs four small Sportmonks requests so we can distinguish:
+    - fixture detail access
+    - basic fixture includes
+    - lineup access
+    - formation access
+    """
+    tests = [
+        ("sin_include", {}),
+        ("basico", {"include": "participants;league;season;state"}),
+        ("lineups", {"include": "lineups"}),
+        ("formations", {"include": "formations"}),
+    ]
+
+    results = []
+    for name, params in tests:
+        endpoint = f"/football/fixtures/{fixture_id}"
+        result = await sportmonks_get(endpoint, params)
+        upstream_data = result.get("data")
+        upstream_message = None
+        if isinstance(upstream_data, dict):
+            upstream_message = upstream_data.get("message")
+            if not isinstance(upstream_message, str):
+                upstream_message = None
+
+        results.append({
+            "test": name,
+            "endpoint": endpoint,
+            "include": params.get("include"),
+            "ok": bool(result.get("ok")),
+            "status_code": result.get("status_code"),
+            "message": upstream_message or result.get("error"),
+            "has_data": bool(
+                isinstance(upstream_data, dict)
+                and upstream_data.get("data")
+            ),
+        })
+
+    return {
+        "status": "diagnostic",
+        "fixture_id": fixture_id,
+        "tests": results,
+        "note": (
+            "Prueba de diagnóstico solamente. No modifica el motor V2.2.5 "
+            "ni sus fórmulas, proyecciones o criterios de publicación."
+        ),
+        "source": "Sportmonks",
+    }
+
+
+# ============================================================
 # API-FOOTBALL CLIENT (FALLBACK)
 # ============================================================
 
