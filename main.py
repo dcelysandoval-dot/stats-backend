@@ -13,7 +13,9 @@ from pydantic import BaseModel, Field
 
 # ============================================================
 # FÚTBOL ANALYTICS - BACKEND V2.2.7
-# Sportmonks principal + API-Football separado + autenticación V3 robusta
+# Sportmonks principal. Ya NO hay fallback a API-Football que reutilice
+# el mismo fixture_id (ver cambio #9 más abajo: eso es la causa del bug
+# de identificación de fixtures cruzados).
 #
 # Cambios respecto a V2.2.5 (revisión de código):
 #   1. collect_sportmonks_player_stats ahora se llama en paralelo
@@ -40,6 +42,26 @@ from pydantic import BaseModel, Field
 #   8. Nota explícita (no resuelta acá, requiere elegir infraestructura):
 #      `bets` y los caches en memoria se pierden en cada reinicio/redeploy.
 #      Para producción real, mover `bets` a una base de datos.
+#
+# Cambios V2.2.7 (fix crítico de integridad de datos):
+#   9. ELIMINADO el fallback que reenviaba el fixture_id de Sportmonks a
+#      API-Football en fixture_analysis(), fixture_detail() y
+#      fixture_lineups(). Sportmonks y API-Football tienen espacios de
+#      IDs completamente distintos e incompatibles: el mismo número
+#      (p. ej. 19722185) puede ser un partido en Sportmonks y otro
+#      partido totalmente distinto en API-Football. Reusar el ID
+#      producía "Player Market Scanner" con jugadores de un partido
+#      equivocado. Ahora, si Sportmonks no puede resolver el fixture,
+#      se devuelve un error controlado
+#      (status: "SPORTMONKS_FIXTURE_UNAVAILABLE") en vez de intentar
+#      adivinar con otro proveedor.
+#  10. Se expone RENDER_GIT_COMMIT (si Render lo define) en / y /health
+#      para poder confirmar qué commit está realmente desplegado.
+#
+# NO se tocó: Poisson, calibración de probabilidad, FA Rating,
+# confianza, proyecciones, forma reciente, ni los criterios de
+# publicación. El fix de V2.2.7 es exclusivamente de identificación
+# de partidos / integridad de datos.
 # ============================================================
 
 logging.basicConfig(level=logging.INFO)
@@ -88,6 +110,11 @@ APIFOOTBALL_URL = "https://v3.football.api-sports.io"
 # define, el endpoint queda abierto como antes (comportamiento por
 # defecto sin cambios), pero se recomienda configurarlo en producción.
 DIAGNOSTIC_TOKEN = os.getenv("DIAGNOSTIC_TOKEN", "").strip()
+
+# Render define automáticamente RENDER_GIT_COMMIT con el SHA del commit
+# que está corriendo. Se expone en / y /health para poder confirmar que
+# el deployment activo corresponde al código más reciente en GitHub.
+DEPLOYED_COMMIT = os.getenv("RENDER_GIT_COMMIT", "").strip()
 
 SUPPORTED_MARKETS = [
     "Remates",
@@ -619,7 +646,7 @@ async def diagnostico_sportmonks_fixture(
         "fixture_id": fixture_id,
         "tests": results,
         "note": (
-            "Prueba de diagnóstico solamente. No modifica el motor V2.2.6 "
+            "Prueba de diagnóstico solamente. No modifica el motor V2.2.7 "
             "ni sus fórmulas, proyecciones o criterios de publicación."
         ),
         "source": "Sportmonks",
@@ -1498,10 +1525,16 @@ def root():
         "status": "ok",
         "project": "Fútbol Analytics",
         "version": APP_VERSION,
+        "deployed_commit": DEPLOYED_COMMIT or None,
         "engine": "Player Market Scanner V2",
         "primary_source": "Sportmonks",
         "sportmonks_configured": bool(SPORTMONKS_TOKEN),
         "api_football_fallback_configured": bool(APIFOOTBALL_KEY),
+        "api_football_fixture_id_fallback": (
+            "disabled_since_v2.2.7 - Sportmonks y API-Football usan "
+            "espacios de IDs de fixture distintos; ya no se reutiliza "
+            "el mismo fixture_id entre proveedores."
+        ),
         "features": [
             "seleccion_de_partido",
             "alineaciones",
@@ -1519,6 +1552,7 @@ def health():
     return {
         "status": "healthy",
         "version": APP_VERSION,
+        "deployed_commit": DEPLOYED_COMMIT or None,
         "sportmonks_configured": bool(SPORTMONKS_TOKEN),
         "api_football_configured": bool(APIFOOTBALL_KEY),
     }
@@ -1718,18 +1752,27 @@ async def fixture_detail(fixture_id: int):
             "source": "Sportmonks",
         }
 
-    # IMPORTANT: fixture_id is a Sportmonks ID in this endpoint.
-    # Never send it to API-Football, whose fixture IDs use a different namespace.
+    # IMPORTANTE: ya NO se hace fallback a API-Football reutilizando el
+    # mismo fixture_id. Sportmonks y API-Football usan espacios de IDs de
+    # fixture distintos e incompatibles entre sí (el mismo número puede
+    # ser un partido completamente distinto en cada proveedor), así que
+    # reenviar el ID puede devolver datos de OTRO partido. Se prefiere
+    # un error controlado antes que identificar mal el fixture.
+    logger.warning(
+        "fixture_detail: Sportmonks no devolvió el fixture_id=%s. %s",
+        fixture_id,
+        result.get("error"),
+    )
     return {
-        "status": "error",
+        "status": "SPORTMONKS_FIXTURE_UNAVAILABLE",
         "fixture_id": fixture_id,
         "message": (
-            "Fixture no disponible desde Sportmonks. "
-            "No se usará el mismo fixture_id como ID de API-Football."
+            "Sportmonks no pudo recuperar este fixture. No se usa "
+            "API-Football como respaldo porque los fixture_id de ambos "
+            "proveedores no son compatibles entre sí."
         ),
-        "details": result.get("data"),
+        "sportmonks_error": result.get("error"),
         "source": "Sportmonks",
-        "fallback": "disabled_for_id_safety",
     }
 
 
@@ -1755,21 +1798,41 @@ async def fixture_lineups(fixture_id: int):
                 "source": "Sportmonks",
             }
 
-    # IMPORTANT: fixture_id is a Sportmonks ID in this endpoint.
-    # Never send it to API-Football, whose fixture IDs use a different namespace.
+        # Sportmonks SÍ reconoce este fixture_id, simplemente todavía no
+        # publicó las alineaciones. Esto no es un problema de identidad
+        # del partido, así que no hace falta ningún fallback: es un
+        # "pending" legítimo.
+        return {
+            "status": "lineups_pending",
+            "fixture_id": fixture_id,
+            "available": False,
+            "lineups": [],
+            "message": "Sportmonks todavía no ha publicado las alineaciones.",
+            "source": "Sportmonks",
+        }
+
+    # IMPORTANTE: ya NO se hace fallback a API-Football reutilizando el
+    # mismo fixture_id. Sportmonks y API-Football usan espacios de IDs de
+    # fixture distintos e incompatibles entre sí: reenviar el mismo ID a
+    # API-Football puede devolver la alineación de OTRO partido. Se
+    # prefiere devolver un error controlado antes que mezclar partidos.
+    logger.warning(
+        "fixture_lineups: Sportmonks no devolvió el fixture_id=%s. %s",
+        fixture_id,
+        result.get("error"),
+    )
     return {
-        "status": "lineups_pending",
+        "status": "SPORTMONKS_FIXTURE_UNAVAILABLE",
         "fixture_id": fixture_id,
         "available": False,
         "lineups": [],
         "message": (
-            (result or {}).get("error")
-            if isinstance(result, dict)
-            else "No fue posible obtener las alineaciones desde Sportmonks."
+            "Sportmonks no pudo recuperar este fixture. No se usa "
+            "API-Football como respaldo porque los fixture_id de ambos "
+            "proveedores no son compatibles entre sí."
         ),
-        "details": (result or {}).get("data") if isinstance(result, dict) else None,
+        "sportmonks_error": result.get("error"),
         "source": "Sportmonks",
-        "fallback": "disabled_for_id_safety",
     }
 
 
@@ -2170,12 +2233,12 @@ async def fixture_analysis_sportmonks(
             "minutos esperados; no incluyen cuotas de bookmaker."
         ),
         "source": "Sportmonks",
-        "motor": "Fútbol Analytics V2.2.6",
+        "motor": "Fútbol Analytics V2.2.7",
     }, None
 
 
 # ============================================================
-# FIXTURE ANALYSIS - SPORTMONKS ONLY (ID-safe)
+# FIXTURE ANALYSIS - FALLBACK API FOOTBALL
 # ============================================================
 
 @app.get("/api/fixture-analysis")
@@ -2183,29 +2246,62 @@ async def fixture_analysis(
     fixture_id: int,
     season: Optional[int] = None,
 ):
+    """
+    FIX V2.2.7 — integridad de datos:
+
+    Antes, si Sportmonks no podía resolver `fixture_id`, este endpoint
+    reenviaba el MISMO número a API-Football (`/fixtures?id=fixture_id`).
+    Eso está mal: Sportmonks y API-Football tienen espacios de IDs de
+    fixture completamente distintos e independientes. El mismo entero
+    (p. ej. 19722185) puede identificar un partido en Sportmonks y un
+    partido totalmente distinto en API-Football. Esto producía que el
+    Player Market Scanner analizara — y publicara picks de — un partido
+    equivocado, sin ningún error visible.
+
+    Ahora: si Sportmonks resuelve el fixture (con datos completos o con
+    alineaciones aún pendientes), se devuelve tal cual. Si Sportmonks NO
+    puede resolver el fixture_id, se devuelve un error controlado
+    (`SPORTMONKS_FIXTURE_UNAVAILABLE`) y NUNCA se intenta adivinar el
+    partido en otro proveedor.
+    """
     primary, error = await fixture_analysis_sportmonks(
         fixture_id,
         season,
     )
 
-    # Only return the primary result when it actually has usable data.
-    # If Sportmonks reports lineups pending, continue to API-Football.
-    if primary is not None and primary.get("available"):
+    if primary is not None:
+        # Sportmonks reconoció este fixture_id — ya sea con datos
+        # completos (available=True) o con alineaciones pendientes
+        # (available=False, status="lineups_pending"). En ambos casos el
+        # ID es válido dentro del espacio de IDs de Sportmonks, así que
+        # se devuelve tal cual, sin cruzar a otro proveedor.
         return primary
 
-    # The fixture_id accepted here is a Sportmonks ID.
-    # Never reuse it as an API-Football ID.
+    # Sportmonks no pudo ni siquiera recuperar el fixture. No hay forma
+    # segura de traducir este fixture_id a un fixture_id de API-Football,
+    # así que se devuelve un error controlado en vez de arriesgarse a
+    # analizar y publicar picks de un partido distinto.
+    logger.warning(
+        "fixture_analysis: Sportmonks no devolvió el fixture_id=%s. %s",
+        fixture_id,
+        (error or {}).get("error"),
+    )
     return {
-        "status": "error",
+        "status": "SPORTMONKS_FIXTURE_UNAVAILABLE",
+        "available": False,
         "fixture_id": fixture_id,
+        "players": [],
         "message": (
-            (error or {}).get("error")
-            if isinstance(error, dict)
-            else "Fixture no disponible desde Sportmonks."
+            "Sportmonks no pudo recuperar este fixture. No se usa "
+            "API-Football como respaldo porque los fixture_id de "
+            "Sportmonks y API-Football no son compatibles entre sí; "
+            "reutilizar el mismo id entre proveedores puede devolver "
+            "datos de un partido distinto."
         ),
-        "details": (error or {}).get("data") if isinstance(error, dict) else None,
+        "sportmonks_error": (error or {}).get("error"),
+        "sportmonks_status_code": (error or {}).get("status_code"),
         "source": "Sportmonks",
-        "fallback": "disabled_for_id_safety",
+        "motor": "Fútbol Analytics V2.2.7",
     }
 
 
@@ -2461,7 +2557,7 @@ async def player_market_scan(
             "No representan cuotas ni líneas de bookmaker."
         ),
         "source": analysis.get("source"),
-        "motor": "Fútbol Analytics V2.2.6",
+        "motor": "Fútbol Analytics V2.2.7",
         "confidence_policy": {
             "alta": "85-100",
             "media": "70-84",
@@ -2561,7 +2657,7 @@ def scanner(request: ScannerRequest):
             if edge > 0
             else "SIN VALOR POSITIVO"
         ),
-        "motor": "Fútbol Analytics V2.2.6",
+        "motor": "Fútbol Analytics V2.2.7",
     }
 
 
@@ -2652,7 +2748,7 @@ def scanner_projection(
             if edge > 0
             else "SIN VALOR POSITIVO"
         ),
-        "motor": "Fútbol Analytics V2.2.6",
+        "motor": "Fútbol Analytics V2.2.7",
     }
 
 
