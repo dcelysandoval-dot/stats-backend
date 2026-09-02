@@ -1,6 +1,7 @@
 import os
 import math
 import asyncio
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -11,11 +12,40 @@ from pydantic import BaseModel, Field
 
 
 # ============================================================
-# FÚTBOL ANALYTICS - BACKEND V2.2.5
+# FÚTBOL ANALYTICS - BACKEND V2.2.6
 # Sportmonks principal + API-Football fallback + autenticación V3 robusta
+#
+# Cambios respecto a V2.2.5 (revisión de código):
+#   1. collect_sportmonks_player_stats ahora se llama en paralelo
+#      (asyncio.gather) en vez de secuencialmente por jugador.
+#   2. Se eliminó TEAM_PLAYER_CACHE / TEAM_PLAYER_CACHE_TTL (código muerto,
+#      nunca se usaban).
+#   3. stat_value() (endpoint de temporada) y lineup_detail_value()
+#      (detalles de alineación de fixture) quedaron separadas y
+#      documentadas, para no mezclar el campo "value" con "data".
+#      Ambas ahora también reconocen la clave "average", usada por
+#      Sportmonks para stats tipo "rating".
+#   4. normalize_sportmonks_lineups y aggregate_recent_fixture_player_stats
+#      ahora loguean (logger.warning) cualquier type_id de alineación que
+#      no sea 11 (titular) ni 12 (suplente), para detectar jugadores que
+#      se estén perdiendo silenciosamente por un type_id no contemplado.
+#   5. Corregido bug de truthiness: blended_per90 ya no confunde 0.0
+#      legítimo con "sin dato".
+#   6. Se añadió una nota + comentarios sobre los IDs hardcodeados en
+#      SPORTMONKS_STAT_TYPES: deben verificarse contra el plan real de
+#      Sportmonks, ya que un id incorrecto falla en silencio (devuelve 0).
+#   7. /api/diagnostico-sportmonks-fixture ahora acepta un token opcional
+#      (DIAGNOSTIC_TOKEN) para no dejarlo completamente abierto si se
+#      define esa variable de entorno.
+#   8. Nota explícita (no resuelta acá, requiere elegir infraestructura):
+#      `bets` y los caches en memoria se pierden en cada reinicio/redeploy.
+#      Para producción real, mover `bets` a una base de datos.
 # ============================================================
 
-APP_VERSION = "2.2.5"
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("futbol_analytics")
+
+APP_VERSION = "2.2.6"
 # Sportmonks uses numeric season IDs (e.g. 28083), while API-Football
 # uses calendar years (e.g. 2026). Keep them separate.
 CURRENT_SEASON_YEAR = int(os.getenv("CURRENT_SEASON_YEAR", os.getenv("CURRENT_SEASON", "2026")))
@@ -54,6 +84,11 @@ SPORTMONKS_URL = "https://api.sportmonks.com/v3"
 APIFOOTBALL_KEY = os.getenv("APIFOOTBALL_KEY", "").strip()
 APIFOOTBALL_URL = "https://v3.football.api-sports.io"
 
+# Token opcional para restringir el endpoint de diagnóstico. Si no se
+# define, el endpoint queda abierto como antes (comportamiento por
+# defecto sin cambios), pero se recomienda configurarlo en producción.
+DIAGNOSTIC_TOKEN = os.getenv("DIAGNOSTIC_TOKEN", "").strip()
+
 SUPPORTED_MARKETS = [
     "Remates",
     "Remates a puerta",
@@ -67,10 +102,14 @@ MIN_STAKE_PERCENT = 1.0
 DEFAULT_STAKE_PERCENT = 2.0
 MAX_STAKE_PERCENT = 3.0
 
+# NOTA DE PRODUCCIÓN (no resuelta en este archivo):
+# `bets` y todos los *_CACHE de abajo viven en memoria del proceso.
+# En Render (y en cualquier entorno con reinicios/redeploys/varias
+# instancias) esto se pierde o se desincroniza. Si el bet tracker debe
+# persistir de verdad, hay que moverlo a una base de datos (Postgres,
+# SQLite, etc.) en lugar de una lista/dict global.
 bets = []
 ALLOWED_BET_RESULTS = {"PENDIENTE", "GANADA", "PERDIDA", "ANULADA"}
-TEAM_PLAYER_CACHE = {}
-TEAM_PLAYER_CACHE_TTL = 300
 PLAYER_STATS_CACHE = {}
 PLAYER_STATS_CACHE_TTL = 300
 RECENT_FORM_CACHE = {}
@@ -89,10 +128,9 @@ def safe_number(value) -> float:
     if isinstance(value, (int, float)):
         return float(value)
     if isinstance(value, dict):
-        if "total" in value:
-            return safe_number(value["total"])
-        if "value" in value:
-            return safe_number(value["value"])
+        for key in ("total", "value", "average", "count"):
+            if key in value and value[key] is not None:
+                return safe_number(value[key])
     try:
         return float(value)
     except Exception:
@@ -522,7 +560,10 @@ async def sportmonks_get(
 # ============================================================
 
 @app.get("/api/diagnostico-sportmonks-fixture")
-async def diagnostico_sportmonks_fixture(fixture_id: int):
+async def diagnostico_sportmonks_fixture(
+    fixture_id: int,
+    token: Optional[str] = None,
+):
     """Diagnose which fixture resource/include is rejected upstream.
 
     This endpoint does not expose the API token or raw fixture payload.
@@ -531,7 +572,17 @@ async def diagnostico_sportmonks_fixture(fixture_id: int):
     - basic fixture includes
     - lineup access
     - formation access
+
+    Si se configura la variable de entorno DIAGNOSTIC_TOKEN, este endpoint
+    exige que se envíe ?token=<DIAGNOSTIC_TOKEN> para poder usarse. Si no
+    se configura, queda abierto (comportamiento anterior, sin cambios).
     """
+    if DIAGNOSTIC_TOKEN and token != DIAGNOSTIC_TOKEN:
+        raise HTTPException(
+            status_code=403,
+            detail="Token de diagnóstico inválido o ausente.",
+        )
+
     tests = [
         ("sin_include", {}),
         ("basico", {"include": "participants;league;season;state"}),
@@ -568,7 +619,7 @@ async def diagnostico_sportmonks_fixture(fixture_id: int):
         "fixture_id": fixture_id,
         "tests": results,
         "note": (
-            "Prueba de diagnóstico solamente. No modifica el motor V2.2.5 "
+            "Prueba de diagnóstico solamente. No modifica el motor V2.2.6 "
             "ni sus fórmulas, proyecciones o criterios de publicación."
         ),
         "source": "Sportmonks",
@@ -650,6 +701,11 @@ async def apifootball_get(
 # SPORTMONKS NORMALIZACIÓN
 # ============================================================
 
+# NOTA: estos type_id están hardcodeados según la documentación pública de
+# Sportmonks V3. Si tu plan/versión de API usa IDs distintos, cualquier
+# estadística mapeada al id incorrecto se quedará en 0 SIN ERROR VISIBLE.
+# Verifica estos valores contra /core/types de tu cuenta si las cifras se
+# ven sospechosamente bajas o en cero.
 SPORTMONKS_STAT_TYPES = {
     42: "shots",
     52: "goals",
@@ -668,14 +724,27 @@ SPORTMONKS_STAT_TYPES = {
 
 
 def stat_value(detail) -> float:
+    """Extrae el valor numérico de un detail de estadísticas de TEMPORADA.
+
+    El endpoint de estadísticas de temporada de Sportmonks expone el valor
+    bajo detail["value"], que puede ser un número directo o un dict con
+    "total" / "value" / "average" / "count" (p. ej. "average" para
+    estadísticas tipo rating).
+    """
     value = detail.get("value")
-
-    if isinstance(value, dict):
-        for key in ("total", "value", "count"):
-            if key in value and value[key] is not None:
-                return safe_number(value[key])
-
     return safe_number(value)
+
+
+def lineup_detail_value(detail) -> float:
+    """Extrae el valor numérico de un detail de alineación de un FIXTURE.
+
+    A diferencia de las estadísticas de temporada, los detalles de
+    alineación de un fixture exponen el valor bajo detail["data"], con
+    detail["value"] como respaldo. Verifica esto contra la respuesta real
+    de tu plan de Sportmonks si los números de forma reciente no cuadran.
+    """
+    raw = detail.get("data", detail.get("value"))
+    return safe_number(raw)
 
 
 def blend_season_and_recent_per90(
@@ -796,6 +865,8 @@ def aggregate_recent_fixture_player_stats(fixtures: list, team_id: int) -> dict:
         119: "minutes",
     }
 
+    unmatched_type_ids = set()
+
     for fixture in fixtures or []:
         fixture_id = fixture.get("id")
         timestamp = fixture.get("starting_at_timestamp")
@@ -806,6 +877,14 @@ def aggregate_recent_fixture_player_stats(fixtures: list, team_id: int) -> dict:
             player_id = lineup.get("player_id")
             if not player_id:
                 continue
+
+            type_id = lineup_type_id(lineup)
+            if type_id not in (11, 12):
+                # No es titular (11) ni suplente en banca (12): lo
+                # registramos para diagnóstico en vez de perderlo en
+                # silencio. Puede tratarse de otro type_id de Sportmonks
+                # (p. ej. entrenador) que no corresponde a un jugador.
+                unmatched_type_ids.add(type_id)
 
             row = {
                 "fixture_id": fixture_id,
@@ -818,19 +897,27 @@ def aggregate_recent_fixture_player_stats(fixtures: list, team_id: int) -> dict:
                 "fouls_committed": 0.0,
                 "fouls_drawn": 0.0,
                 "yellow_cards": 0.0,
-                "started": lineup_type_id(lineup) == 11,
+                "started": type_id == 11,
             }
 
             for detail in lineup.get("details") or []:
                 key = metric_types.get(int(safe_number(detail.get("type_id"))))
                 if key:
-                    row[key] += stat_value({"value": detail.get("data", detail.get("value"))})
+                    row[key] += lineup_detail_value(detail)
 
             # No recorded minutes means the player did not participate.
             if row["minutes"] <= 0:
                 continue
 
             result.setdefault(player_id, []).append(row)
+
+    if unmatched_type_ids:
+        logger.warning(
+            "aggregate_recent_fixture_player_stats: type_id de alineación "
+            "no reconocidos (ni 11 ni 12): %s. Revisa si corresponden a "
+            "jugadores que se están perdiendo en las estadísticas.",
+            sorted(unmatched_type_ids),
+        )
 
     for rows in result.values():
         rows.sort(key=lambda x: x.get("timestamp") or 0, reverse=True)
@@ -980,6 +1067,8 @@ def normalize_sportmonks_lineups(fixture_item: dict) -> list:
         if participant_id is not None:
             participant_by_id[str(participant_id)] = participant
 
+    unmatched_type_ids = set()
+
     for entry in raw:
         team_id = entry.get("team_id")
         if team_id is None:
@@ -1022,6 +1111,7 @@ def normalize_sportmonks_lineups(fixture_item: dict) -> list:
             group["team"]["logo"] = team_logo
 
         player_obj = entry.get("player") or {}
+        type_id = lineup_type_id(entry)
         player = {
             "player_id": entry.get("player_id") or player_obj.get("id"),
             "name": entry.get("player_name") or player_obj.get("name"),
@@ -1029,14 +1119,25 @@ def normalize_sportmonks_lineups(fixture_item: dict) -> list:
             "position_id": entry.get("position_id"),
             "formation_field": entry.get("formation_field"),
             "formation_position": entry.get("formation_position"),
-            "starter": lineup_type_id(entry) == 11,
-            "substitute": lineup_type_id(entry) == 12,
+            "starter": type_id == 11,
+            "substitute": type_id == 12,
         }
 
         if player["starter"]:
             group["starters"].append(player)
         elif player["substitute"]:
             group["substitutes"].append(player)
+        else:
+            unmatched_type_ids.add(type_id)
+
+    if unmatched_type_ids:
+        logger.warning(
+            "normalize_sportmonks_lineups: type_id de alineación no "
+            "reconocidos (ni 11 ni 12) para fixture_id=%s: %s. Esas filas "
+            "no se agregan a starters ni substitutes.",
+            fixture_item.get("id"),
+            sorted(unmatched_type_ids),
+        )
 
     return list(grouped.values())
 
@@ -1617,19 +1718,47 @@ async def fixture_detail(fixture_id: int):
             "source": "Sportmonks",
         }
 
-    # Do not reuse a Sportmonks fixture_id in API-Football.
-    return {
-        "status": "sportmonks_fixture_unavailable",
-        "fixture_id": fixture_id,
-        "message": (
-            "Sportmonks no pudo recuperar el fixture por ID. "
-            "No se usa API-Football como fallback automático porque sus "
-            "fixture_id pertenecen a otra numeración."
-        ),
-        "details": result["data"],
-        "source": "Sportmonks",
-    }
+    # Fallback
+    fallback = await apifootball_get(
+        "/fixtures",
+        {"id": fixture_id},
+    )
 
+    if not fallback["ok"]:
+        return {
+            "status": "error",
+            "fixture_id": fixture_id,
+            "message": result["error"],
+            "details": result["data"],
+            "fallback": fallback["error"],
+        }
+
+    response = fallback["data"].get("response", [])
+    if not response:
+        return {
+            "status": "not_found",
+            "fixture_id": fixture_id,
+            "message": "Fixture no encontrado.",
+        }
+
+    item = response[0]
+    fixture = item.get("fixture") or {}
+    teams = item.get("teams") or {}
+    league = item.get("league") or {}
+
+    return {
+        "status": "ok",
+        "fixture": {
+            "fixture_id": fixture.get("id"),
+            "date": fixture.get("date"),
+            "timestamp": fixture.get("timestamp"),
+            "status": fixture.get("status"),
+            "league": league,
+            "home": teams.get("home"),
+            "away": teams.get("away"),
+        },
+        "source": "API-Football-fallback",
+    }
 
 
 # ============================================================
@@ -1654,21 +1783,80 @@ async def fixture_lineups(fixture_id: int):
                 "source": "Sportmonks",
             }
 
-    # Do not reuse a Sportmonks fixture_id in API-Football.
-    return {
-        "status": "sportmonks_fixture_unavailable",
-        "fixture_id": fixture_id,
-        "available": False,
-        "lineups": [],
-        "message": (
-            "Sportmonks no pudo recuperar las alineaciones para este fixture. "
-            "No se usa API-Football con el mismo fixture_id porque ambas APIs "
-            "usan identificadores distintos."
-        ),
-        "details": result["data"],
-        "source": "Sportmonks",
-    }
+    # Fallback
+    fallback = await apifootball_get(
+        "/fixtures/lineups",
+        {"fixture": fixture_id},
+    )
 
+    if not fallback["ok"]:
+        return {
+            "status": "lineups_pending",
+            "fixture_id": fixture_id,
+            "available": False,
+            "lineups": [],
+            "message": result["error"],
+            "fallback": fallback["error"],
+        }
+
+    response = fallback["data"].get("response", [])
+
+    if not response:
+        return {
+            "status": "lineups_pending",
+            "fixture_id": fixture_id,
+            "available": False,
+            "lineups": [],
+            "message": "Las alineaciones todavía no están disponibles.",
+        }
+
+    lineups = []
+
+    for block in response:
+        team = block.get("team") or {}
+        coach = block.get("coach") or {}
+
+        starters = []
+        substitutes = []
+
+        for entry in block.get("startXI", []) or []:
+            player = entry.get("player") or {}
+            starters.append({
+                "player_id": player.get("id"),
+                "name": player.get("name"),
+                "number": player.get("number"),
+                "position": player.get("pos"),
+                "starter": True,
+            })
+
+        for entry in block.get("substitutes", []) or []:
+            player = entry.get("player") or {}
+            substitutes.append({
+                "player_id": player.get("id"),
+                "name": player.get("name"),
+                "number": player.get("number"),
+                "position": player.get("pos"),
+                "starter": False,
+            })
+
+        lineups.append({
+            "team": team,
+            "coach": coach,
+            "formation": block.get("formation"),
+            "starters": starters,
+            "substitutes": substitutes,
+            "starter_count": len(starters),
+            "substitute_count": len(substitutes),
+        })
+
+    return {
+        "status": "confirmed_lineups",
+        "available": True,
+        "fixture_id": fixture_id,
+        "count": len(lineups),
+        "lineups": lineups,
+        "source": "API-Football-fallback",
+    }
 
 
 # ============================================================
@@ -1824,8 +2012,6 @@ async def fixture_analysis_sportmonks(
         or None
     )
 
-    players = []
-
     # Keep team metadata attached even if a lineup row arrives without a
     # populated team object. Sportmonks fixture participants are the source
     # of truth for the home/away team names.
@@ -1835,6 +2021,8 @@ async def fixture_analysis_sportmonks(
         if p.get("id") is not None
     }
 
+    # --- Paso 1: recolectar entradas de jugador (sin llamadas a la red) ---
+    lineup_entries = []
     for lineup in lineups:
         team = lineup.get("team") or {}
         team_id = team.get("id")
@@ -1852,109 +2040,125 @@ async def fixture_analysis_sportmonks(
             pid = entry.get("player_id")
             if not pid:
                 continue
+            lineup_entries.append((entry, team_name, team_id))
 
-            stats = await collect_sportmonks_player_stats(
-                pid,
-                int(season_id) if season_id else None,
+    # --- Paso 2: pedir las estadísticas de todos los jugadores EN PARALELO ---
+    # Antes esto se hacía con `await` dentro del for loop, uno por uno, lo
+    # que podía significar 30+ llamadas HTTP secuenciales a Sportmonks para
+    # un solo fixture. Ahora se lanzan todas juntas con asyncio.gather.
+    stats_tasks = [
+        collect_sportmonks_player_stats(
+            entry.get("player_id"),
+            int(season_id) if season_id else None,
+        )
+        for entry, _team_name, _team_id in lineup_entries
+    ]
+    all_stats = (
+        await asyncio.gather(*stats_tasks)
+        if stats_tasks else []
+    )
+
+    # --- Paso 3: construir los objetos de jugador con las stats ya listas ---
+    players = []
+    for (entry, team_name, team_id), stats in zip(lineup_entries, all_stats):
+        pid = entry.get("player_id")
+        starter = bool(entry.get("starter"))
+
+        minutes = safe_number(stats.get("minutes"))
+        appearances = safe_number(stats.get("appearances"))
+        starts = safe_number(stats.get("starts"))
+
+        if starter:
+            expected_minutes = 75.0
+            if appearances > 0:
+                start_rate = starts / appearances
+                if start_rate >= 0.75:
+                    expected_minutes = 80.0
+                elif start_rate >= 0.50:
+                    expected_minutes = 77.0
+        else:
+            expected_minutes = 20.0
+
+        def project(key, stats=stats, expected_minutes=expected_minutes):
+            return round2(
+                safe_number(stats.get(key + "_per90"))
+                * expected_minutes / 90.0
             )
 
-            starter = bool(entry.get("starter"))
-
-            minutes = safe_number(stats.get("minutes"))
-            appearances = safe_number(stats.get("appearances"))
-            starts = safe_number(stats.get("starts"))
-
-            if starter:
-                expected_minutes = 75.0
-                if appearances > 0:
-                    start_rate = starts / appearances
-                    if start_rate >= 0.75:
-                        expected_minutes = 80.0
-                    elif start_rate >= 0.50:
-                        expected_minutes = 77.0
-            else:
-                expected_minutes = 20.0
-
-            def project(key):
-                return round2(
-                    safe_number(stats.get(key + "_per90"))
-                    * expected_minutes / 90.0
+        stats_available = (
+            minutes > 0
+            or appearances > 0
+            or starts > 0
+            or any(
+                safe_number(stats.get(key)) > 0
+                for key in (
+                    "shots",
+                    "shots_on_target",
+                    "goals",
+                    "assists",
+                    "fouls_committed",
+                    "yellow_cards",
                 )
-
-            stats_available = (
-                minutes > 0
-                or appearances > 0
-                or starts > 0
-                or any(
-                    safe_number(stats.get(key)) > 0
-                    for key in (
-                        "shots",
-                        "shots_on_target",
-                        "goals",
-                        "assists",
-                        "fouls_committed",
-                        "yellow_cards",
-                    )
-                )
             )
+        )
 
-            data_quality, data_quality_reason = classify_data_quality(
-                minutes,
-                appearances,
-            )
+        data_quality, data_quality_reason = classify_data_quality(
+            minutes,
+            appearances,
+        )
 
-            confidence = calculate_data_confidence(
-                minutes=minutes,
-                appearances=appearances,
-                starts=starts,
-                starter=starter,
-            )
+        confidence = calculate_data_confidence(
+            minutes=minutes,
+            appearances=appearances,
+            starts=starts,
+            starter=starter,
+        )
 
-            players.append({
-                "player_id": pid,
-                "player": entry.get("name"),
-                "team": team_name,
-                "team_id": team_id,
-                "number": entry.get("number"),
-                "position_id": entry.get("position_id"),
-                "formation_field": entry.get("formation_field"),
-                "starter": starter,
-                "confirmed_lineup": True,
-                "expected_minutes": expected_minutes,
-                "stats_available": stats_available,
-                "data_quality": data_quality,
-                "data_quality_reason": data_quality_reason,
-                "confidence": confidence,
+        players.append({
+            "player_id": pid,
+            "player": entry.get("name"),
+            "team": team_name,
+            "team_id": team_id,
+            "number": entry.get("number"),
+            "position_id": entry.get("position_id"),
+            "formation_field": entry.get("formation_field"),
+            "starter": starter,
+            "confirmed_lineup": True,
+            "expected_minutes": expected_minutes,
+            "stats_available": stats_available,
+            "data_quality": data_quality,
+            "data_quality_reason": data_quality_reason,
+            "confidence": confidence,
 
-                "minutes_season": minutes,
-                "appearances_season": appearances,
-                "starts_season": starts,
+            "minutes_season": minutes,
+            "appearances_season": appearances,
+            "starts_season": starts,
 
-                "shots_season": stats.get("shots", 0),
-                "shots_on_target_season": stats.get("shots_on_target", 0),
-                "goals_season": stats.get("goals", 0),
-                "assists_season": stats.get("assists", 0),
-                "fouls_committed_season": stats.get("fouls_committed", 0),
-                "fouls_drawn_season": stats.get("fouls_drawn", 0),
-                "yellow_cards_season": stats.get("yellow_cards", 0),
+            "shots_season": stats.get("shots", 0),
+            "shots_on_target_season": stats.get("shots_on_target", 0),
+            "goals_season": stats.get("goals", 0),
+            "assists_season": stats.get("assists", 0),
+            "fouls_committed_season": stats.get("fouls_committed", 0),
+            "fouls_drawn_season": stats.get("fouls_drawn", 0),
+            "yellow_cards_season": stats.get("yellow_cards", 0),
 
-                "shots_per90": stats.get("shots_per90", 0),
-                "shots_on_target_per90": stats.get("shots_on_target_per90", 0),
-                "goals_per90": stats.get("goals_per90", 0),
-                "assists_per90": stats.get("assists_per90", 0),
-                "fouls_committed_per90": stats.get("fouls_committed_per90", 0),
-                "fouls_drawn_per90": stats.get("fouls_drawn_per90", 0),
-                "yellow_cards_per90": stats.get("yellow_cards_per90", 0),
+            "shots_per90": stats.get("shots_per90", 0),
+            "shots_on_target_per90": stats.get("shots_on_target_per90", 0),
+            "goals_per90": stats.get("goals_per90", 0),
+            "assists_per90": stats.get("assists_per90", 0),
+            "fouls_committed_per90": stats.get("fouls_committed_per90", 0),
+            "fouls_drawn_per90": stats.get("fouls_drawn_per90", 0),
+            "yellow_cards_per90": stats.get("yellow_cards_per90", 0),
 
-                "projection": {
-                    "Remates": project("shots"),
-                    "Remates a puerta": project("shots_on_target"),
-                    "Goles": project("goals"),
-                    "Asistencias": project("assists"),
-                    "Faltas": project("fouls_committed"),
-                    "Tarjetas": project("yellow_cards"),
-                },
-            })
+            "projection": {
+                "Remates": project("shots"),
+                "Remates a puerta": project("shots_on_target"),
+                "Goles": project("goals"),
+                "Asistencias": project("assists"),
+                "Faltas": project("fouls_committed"),
+                "Tarjetas": project("yellow_cards"),
+            },
+        })
 
     # Recency layer: fetch the latest completed team fixtures once per team
     # and reuse them for every player in the current lineup. This avoids the
@@ -2052,7 +2256,7 @@ async def fixture_analysis_sportmonks(
             "minutos esperados; no incluyen cuotas de bookmaker."
         ),
         "source": "Sportmonks",
-        "motor": "Fútbol Analytics V2.2.5",
+        "motor": "Fútbol Analytics V2.2.6",
     }, None
 
 
@@ -2075,28 +2279,117 @@ async def fixture_analysis(
     if primary is not None and primary.get("available"):
         return primary
 
-    # IMPORTANT:
-    # `fixture_id` is a Sportmonks identifier. API-Football uses a separate
-    # identifier namespace, so passing this ID directly to API-Football can
-    # return a completely different match. Never fall back by reusing the ID.
+    # Si Sportmonks falla, usamos API-Football como respaldo.
+    fixture_result = await apifootball_get(
+        "/fixtures",
+        {"id": fixture_id},
+    )
+
+    if not fixture_result["ok"]:
+        return {
+            "status": "error",
+            "fixture_id": fixture_id,
+            "message": error["error"] if error else "Error",
+            "details": error["data"] if error else None,
+            "fallback": fixture_result["error"],
+        }
+
+    fixtures = fixture_result["data"].get("response", [])
+
+    if not fixtures:
+        return {
+            "status": "not_found",
+            "fixture_id": fixture_id,
+            "message": "Fixture no encontrado.",
+        }
+
+    item = fixtures[0]
+    fixture = item.get("fixture") or {}
+    teams = item.get("teams") or {}
+    league = item.get("league") or {}
+
+    lineup_result = await apifootball_get(
+        "/fixtures/lineups",
+        {"fixture": fixture_id},
+    )
+
+    if not lineup_result["ok"]:
+        return {
+            "status": "lineups_pending",
+            "available": False,
+            "fixture_id": fixture_id,
+            "players": [],
+            "message": "No fue posible obtener las alineaciones.",
+            "details": lineup_result["data"],
+        }
+
+    lineup_response = lineup_result["data"].get("response", [])
+
+    if not lineup_response:
+        return {
+            "status": "lineups_pending",
+            "available": False,
+            "fixture_id": fixture_id,
+            "players": [],
+            "message": "Las alineaciones todavía no están disponibles.",
+        }
+
+    players = []
+
+    for block in lineup_response:
+        team = block.get("team") or {}
+
+        for entry in (
+            list(block.get("startXI", []) or [])
+            + list(block.get("substitutes", []) or [])
+        ):
+            p = entry.get("player") or {}
+            pid = p.get("id")
+            if not pid:
+                continue
+
+            starter = entry in (block.get("startXI", []) or [])
+
+            # Fallback conserva el formato V1.9, pero sin hacer
+            # múltiples llamadas innecesarias por jugador.
+            players.append({
+                "player_id": pid,
+                "player": p.get("name"),
+                "team": team.get("name"),
+                "team_id": team.get("id"),
+                "number": p.get("number"),
+                "position": p.get("pos"),
+                "starter": starter,
+                "confirmed_lineup": True,
+                "expected_minutes": 75 if starter else 20,
+                "stats_available": False,
+                "data_quality": "BAJA",
+                "confidence": 55 if starter else 35,
+                "projection": {
+                    market: 0.0 for market in SUPPORTED_MARKETS
+                },
+            })
+
     return {
-        "status": "sportmonks_fixture_unavailable",
-        "available": False,
+        "status": "lineups_only",
+        "available": True,
         "fixture_id": fixture_id,
-        "message": (
-            "Sportmonks no pudo recuperar este fixture por ID. "
-            "Se evita el fallback automático a API-Football porque los "
-            "fixture_id de ambas APIs no son compatibles y podrían mezclar "
-            "datos de otro partido."
-        ),
-        "details": error["data"] if error else None,
-        "sportmonks_error": error["error"] if error else None,
-        "fallback": {
-            "enabled": False,
-            "reason": "El fixture_id de Sportmonks no puede reutilizarse en API-Football.",
+        "season": api_football_season_year(season),
+        "fixture": {
+            "date": fixture.get("date"),
+            "status": fixture.get("status"),
+            "league": league,
+            "home": teams.get("home"),
+            "away": teams.get("away"),
         },
-        "source": "Sportmonks",
-        "motor": "Fútbol Analytics V2.2.5",
+        "lineups_confirmed": True,
+        "count": len(players),
+        "starter_count": sum(1 for p in players if p["starter"]),
+        "substitute_count": sum(1 for p in players if not p["starter"]),
+        "players": players,
+        "markets": SUPPORTED_MARKETS,
+        "source": "API-Football-fallback",
+        "motor": "Fútbol Analytics V2.2.6",
     }
 
 
@@ -2213,6 +2506,18 @@ def build_market_candidates(players: list, limit: int = 6) -> list:
                 stats_available=stats_available,
                 sample_sufficient=sample_sufficient,
             )
+
+            # Corrección: antes se usaba `... or round2(player.get(key))`,
+            # lo que trataba un blended_per90 legítimo de 0.0 como "sin
+            # dato" y lo reemplazaba por el per90 de temporada. Ahora se
+            # comprueba explícitamente con `is not None`.
+            blended_raw = player.get(key + "_blended")
+            blended_per90 = (
+                round2(blended_raw)
+                if blended_raw is not None
+                else round2(player.get(key))
+            )
+
             candidates.append({
                 "player_id": player.get("player_id"),
                 "player": player.get("player"),
@@ -2223,7 +2528,7 @@ def build_market_candidates(players: list, limit: int = 6) -> list:
                 "expected_minutes": round2(player.get("expected_minutes")),
                 "projection_basis": {
                     "per90": round2(player.get(key)),
-                    "blended_per90": round2(player.get(key + "_blended")) or round2(player.get(key)),
+                    "blended_per90": blended_per90,
                     "expected_minutes": round2(player.get("expected_minutes")),
                     "season_minutes": round2(player.get("minutes_season")),
                     "season_appearances": round2(player.get("appearances_season")),
@@ -2340,7 +2645,7 @@ async def player_market_scan(
             "No representan cuotas ni líneas de bookmaker."
         ),
         "source": analysis.get("source"),
-        "motor": "Fútbol Analytics V2.2.5",
+        "motor": "Fútbol Analytics V2.2.6",
         "confidence_policy": {
             "alta": "85-100",
             "media": "70-84",
@@ -2440,7 +2745,7 @@ def scanner(request: ScannerRequest):
             if edge > 0
             else "SIN VALOR POSITIVO"
         ),
-        "motor": "Fútbol Analytics V2.2.5",
+        "motor": "Fútbol Analytics V2.2.6",
     }
 
 
@@ -2531,7 +2836,7 @@ def scanner_projection(
             if edge > 0
             else "SIN VALOR POSITIVO"
         ),
-        "motor": "Fútbol Analytics V2.2.5",
+        "motor": "Fútbol Analytics V2.2.6",
     }
 
 
