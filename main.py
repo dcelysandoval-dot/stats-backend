@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 
 
 # ============================================================
-# FÚTBOL ANALYTICS - BACKEND V2.2.8
+# FÚTBOL ANALYTICS - BACKEND V2.2.9
 # Sportmonks principal. Ya NO hay fallback a API-Football que reutilice
 # el mismo fixture_id (ver cambio #9 más abajo: eso es la causa del bug
 # de identificación de fixtures cruzados).
@@ -67,7 +67,7 @@ from pydantic import BaseModel, Field
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("futbol_analytics")
 
-APP_VERSION = "2.2.8"
+APP_VERSION = "2.2.9"
 # Sportmonks uses numeric season IDs (e.g. 28083), while API-Football
 # uses calendar years (e.g. 2026). Keep them separate.
 CURRENT_SEASON_YEAR = int(os.getenv("CURRENT_SEASON_YEAR", os.getenv("CURRENT_SEASON", "2026")))
@@ -2521,7 +2521,51 @@ def model_probability_for_side(
     return probability_under(line, projection, confidence)
 
 
+
+def evaluate_player_market_v2_2_9(player: dict) -> list:
+    """Evaluate all six markets as statistical signals only.
+
+    No bookmaker line is inferred. Until real line/odds arrive, every market
+    remains NO BET while retaining its projection and threshold reason.
+    """
+    player = player or {}
+    projection_map = player.get("projection") or {}
+    rows = []
+    profile = player_market_profile(player)
+    for market in MARKET_KEYS:
+        projection = round2(projection_map.get(market))
+        threshold = safe_number(MARKET_RULES[market]["min_projection"])
+        if projection < threshold:
+            reason = (
+                f"Proyección {projection:.2f} por debajo del mínimo de acción {threshold:.2f}."
+            )
+        else:
+            reason = (
+                "Señal estadística relevante. Requiere línea y cuota reales del bookmaker "
+                "para decidir OVER/UNDER y calcular Value Edge."
+            )
+        rows.append({
+            "market": market,
+            "projection": projection,
+            "decision": "NO BET",
+            "reference_side": None,
+            "reference_line": None,
+            "probability_fa": None,
+            "actionability_score": 0 if projection < threshold else round2(min(100, 50 + projection / max(threshold, 0.1) * 20)),
+            "market_threshold": threshold,
+            "reason": reason,
+            "profile": profile,
+            "market_data_status": "REQUIERE_LINEA_Y_CUOTA_REALES",
+        })
+    return rows
+
 def build_market_candidates(players: list, limit: int = 6) -> list:
+    """Return statistical market candidates without inventing bookmaker lines.
+
+    V2.2.9 separates model opportunity from real-market value: without a real
+    bookmaker line and odds, a candidate is informational only and remains
+    NO BET.
+    """
     candidates = []
 
     for player in players or []:
@@ -2532,63 +2576,24 @@ def build_market_candidates(players: list, limit: int = 6) -> list:
         if confidence < 60:
             continue
 
-        evaluations = evaluate_player_market_v2_2_8(player)
+        evaluations = evaluate_player_market_v2_2_9(player)
         sample_sufficient = is_sample_sufficient_for_recommendation(player)
         confirmed_lineup = bool(player.get("confirmed_lineup"))
         stats_available = bool(player.get("stats_available"))
         profile = player_market_profile(player)
 
         for evaluation in evaluations:
-            if evaluation["decision"] == "NO BET":
+            if evaluation["decision"] == "NO BET" and safe_number(evaluation.get("projection")) < safe_number(evaluation.get("market_threshold")):
                 continue
 
             projection = safe_number(evaluation.get("projection"))
-            probability = safe_number(evaluation.get("probability_fa"))
-            if probability <= 0:
+            threshold = safe_number(evaluation.get("market_threshold"))
+            if projection < threshold:
                 continue
 
-            # Keep the rating strong when the market is actionable, but do not
-            # let probability alone create a 90+ rating from a trivial line.
-            actionability = safe_number(evaluation.get("actionability_score"))
-            raw_rating = round(
-                max(
-                    0,
-                    min(
-                        100,
-                        probability * 0.55
-                        + confidence * 0.30
-                        + actionability * 0.15,
-                    ),
-                )
-            )
-
-            rating = adjust_rating_for_data_quality(
-                raw_rating,
-                confidence,
-            )
-
-            publishable = is_publishable_candidate(
-                confidence=confidence,
-                rating=rating,
-                confirmed_lineup=confirmed_lineup,
-                stats_available=stats_available,
-                sample_sufficient=sample_sufficient,
-            )
-            recommendation = classify_recommendation(
-                confidence=confidence,
-                rating=rating,
-                confirmed_lineup=confirmed_lineup,
-                stats_available=stats_available,
-                sample_sufficient=sample_sufficient,
-            )
-
-            blended_raw = player.get(MARKET_KEYS[evaluation["market"]] + "_blended")
-            base_key = MARKET_KEYS[evaluation["market"]]
-            blended_per90 = (
-                round2(blended_raw)
-                if blended_raw is not None
-                else round2(player.get(base_key))
-            )
+            proximity_score = max(0.0, min(100.0, 50.0 + (projection / max(threshold, 0.1)) * 20.0))
+            raw_rating = round(max(0, min(100, confidence * 0.55 + proximity_score * 0.25 + (30 if sample_sufficient else 10))))
+            rating = adjust_rating_for_data_quality(raw_rating, confidence)
 
             candidates.append({
                 "player_id": player.get("player_id"),
@@ -2599,8 +2604,8 @@ def build_market_candidates(players: list, limit: int = 6) -> list:
                 "projection": round2(projection),
                 "expected_minutes": round2(player.get("expected_minutes")),
                 "projection_basis": {
-                    "per90": round2(player.get(base_key)),
-                    "blended_per90": blended_per90,
+                    "per90": round2(player.get(MARKET_KEYS[evaluation["market"]])),
+                    "blended_per90": round2(player.get(MARKET_KEYS[evaluation["market"]] + "_blended")) if player.get(MARKET_KEYS[evaluation["market"]] + "_blended") is not None else round2(player.get(MARKET_KEYS[evaluation["market"]])),
                     "expected_minutes": round2(player.get("expected_minutes")),
                     "season_minutes": round2(player.get("minutes_season")),
                     "season_appearances": round2(player.get("appearances_season")),
@@ -2611,53 +2616,102 @@ def build_market_candidates(players: list, limit: int = 6) -> list:
                     "recent_form_available": bool(player.get("recent_form_available")),
                     "method": player.get("projection_method", "temporada"),
                 },
-                "reference_side": evaluation["reference_side"],
-                "reference_line": round2(evaluation["reference_line"]),
-                "probability_fa": round2(probability),
-                "probability_model": "Poisson + confidence calibration + adaptive reference line",
+                "reference_side": None,
+                "reference_line": None,
+                "probability_fa": None,
+                "probability_model": "Pendiente de línea real del bookmaker",
                 "fa_rating": rating,
                 "raw_fa_rating": raw_rating,
                 "confidence": round2(confidence),
                 "confidence_band": confidence_band(confidence),
-                "publishable": publishable,
-                "recommendation": recommendation,
-                "decision": evaluation["decision"],
-                "actionability_score": actionability,
-                "market_reason": evaluation["reason"],
+                "publishable": False,
+                "recommendation": "REQUIERE_MERCADO_REAL",
+                "decision": "NO BET",
+                "actionability_score": round2(proximity_score),
+                "market_reason": "La proyección identifica un mercado estadísticamente relevante, pero faltan línea y cuota reales del bookmaker.",
                 "player_profile": profile,
                 "data_quality": player.get("data_quality", "BAJA"),
                 "data_quality_reason": player.get("data_quality_reason", "No disponible"),
                 "sample_sufficient_for_recommendation": sample_sufficient,
                 "sample_quality_basis": (
                     "temporada_media_alta"
-                    if classify_data_quality(
-                        player.get("minutes_season", 0),
-                        player.get("appearances_season", 0),
-                    )[0] in {"MEDIA", "ALTA"}
-                    else (
-                        "forma_reciente_solida"
-                        if sample_sufficient
-                        else "muestra_insuficiente"
-                    )
+                    if classify_data_quality(player.get("minutes_season", 0), player.get("appearances_season", 0))[0] in {"MEDIA", "ALTA"}
+                    else ("forma_reciente_solida" if sample_sufficient else "muestra_insuficiente")
                 ),
                 "projection_method": player.get("projection_method", "temporada"),
                 "recent_form_matches": player.get("recent_form_matches", 0),
                 "stats_available": stats_available,
                 "confirmed_lineup": confirmed_lineup,
+                "market_data_status": "REQUIERE_LINEA_Y_CUOTA_REALES",
             })
 
     candidates.sort(
-        key=lambda x: (
-            x["fa_rating"],
-            x["actionability_score"],
-            x["probability_fa"],
-            x["projection"],
-        ),
+        key=lambda x: (x["fa_rating"], x["actionability_score"], x["projection"]),
         reverse=True,
     )
-
-    # V2.2.8 intentionally does not require six opportunities.
     return candidates[:max(1, min(limit, 20))]
+
+
+def evaluate_real_market(
+    projection: float,
+    line: float | None,
+    odds: float | None,
+    confidence: float = 70,
+    side: str = "auto",
+) -> dict:
+    """Evaluate a real bookmaker market; never fabricate line or odds."""
+    if line is None or odds is None or safe_number(line) <= 0 or safe_number(odds) <= 1:
+        raise ValueError("Se requieren línea y cuota reales del bookmaker.")
+
+    side = (side or "auto").strip().lower()
+    if side not in {"over", "under", "auto"}:
+        raise ValueError("side debe ser 'over', 'under' o 'auto'.")
+
+    projection = safe_number(projection)
+    confidence = safe_number(confidence) or 50
+    line = safe_number(line)
+    odds = safe_number(odds)
+
+    def evaluate_one(chosen_side: str) -> dict:
+        probability = (
+            probability_over(line, projection, confidence)
+            if chosen_side == "over"
+            else probability_under(line, projection, confidence)
+        )
+        edge = value_edge(probability, odds)
+        return {
+            "side": chosen_side,
+            "probability_fa": round2(probability),
+            "implied_probability": implied_probability(odds),
+            "value_edge": edge,
+        }
+
+    if side == "auto":
+        options = [evaluate_one("over"), evaluate_one("under")]
+        best = max(options, key=lambda item: (item["value_edge"], item["probability_fa"]))
+    else:
+        best = evaluate_one(side)
+
+    decision = best["side"].upper() if best["value_edge"] > 0 else "NO BET"
+    rating = fa_rating(best["probability_fa"], best["value_edge"], confidence)
+
+    return {
+        **best,
+        "decision": decision,
+        "projection": round2(projection),
+        "line": round2(line),
+        "odds": round2(odds),
+        "line_source": "bookmaker",
+        "odds_source": "bookmaker",
+        "confidence": round2(confidence),
+        "fa_rating": rating,
+        "risk": risk_from_rating(rating),
+        "signal": signal_from_edge(best["value_edge"]),
+        "value_positive": best["value_edge"] > 0,
+        "recommendation": "OPORTUNIDAD CON VALOR" if best["value_edge"] > 0 else "SIN VALOR POSITIVO",
+        "market_data_status": "REAL",
+        "model_note": "La línea y la cuota fueron proporcionadas como datos reales del bookmaker; no fueron generadas por Fútbol Analytics.",
+    }
 
 
 @app.get("/api/player-market-scan")
@@ -2684,7 +2738,7 @@ async def player_market_scan(
             "player": player.get("player"),
             "team": player.get("team"),
             "profile": player_market_profile(player),
-            "markets": evaluate_player_market_v2_2_8(player),
+            "markets": evaluate_player_market_v2_2_9(player),
         }
         for player in players
         if player.get("starter")
@@ -2729,14 +2783,14 @@ async def player_market_scan(
         "all_market_evaluations": all_market_evaluations,
         "players_with_multiple_opportunities": players_with_multiple_opportunities,
         "multi_market_enabled": True,
+        "real_market_required": True,
         "forced_six_picks": False,
         "candidates": candidates,
         "note": (
-            "Las líneas mostradas son referencias matemáticas. "
-            "No representan cuotas ni líneas de bookmaker."
+            "V2.2.9 no inventa líneas ni cuotas. Las oportunidades del Scanner son estadísticas hasta recibir línea y cuota reales del bookmaker."
         ),
         "source": analysis.get("source"),
-        "motor": "Fútbol Analytics V2.2.8",
+        "motor": "Fútbol Analytics V2.2.9",
         "confidence_policy": {
             "alta": "85-100",
             "media": "70-84",
@@ -2754,11 +2808,41 @@ async def player_market_scan(
             "publishable": "confidence >= 70 + FA rating >= 70 + alineación confirmada + estadísticas disponibles + muestra suficiente",
             "pick_precaucion": "buenos scores pero muestra insuficiente; no se trata como pick fuerte",
             "sample_gate": "temporada MEDIA/ALTA o forma reciente SOLIDA (>=5 partidos y >=360 min)",
-            "market_selection": "evalúa los 6 mercados por titular; permite múltiples mercados por jugador; OVER/UNDER/NO BET",
-            "selection_policy": "no se fuerzan 6 picks; se publican solo mercados accionables y cercanos a la proyección",
+            "market_selection": "evalúa los 6 mercados por titular; permite múltiples mercados por jugador; sin línea/cuota real la salida es NO BET",
+            "selection_policy": "no se fuerzan picks; no se publica OVER/UNDER sin línea y cuota reales del bookmaker",
             "review_only": "confidence 60-69, muestra insuficiente o datos requeridos incompletos",
             "excluded": "confidence < 60",
         },
+    }
+
+
+class RealMarketRequest(BaseModel):
+    player: str
+    market: str
+    projection: float = Field(ge=0)
+    line: float = Field(gt=0)
+    odds: float = Field(gt=1)
+    confidence: float = Field(default=70, ge=0, le=100)
+    side: str = "auto"
+
+
+@app.post("/api/player-market-evaluate")
+def player_market_evaluate(request: RealMarketRequest):
+    if request.market not in SUPPORTED_MARKETS:
+        raise HTTPException(status_code=400, detail="Mercado no soportado.")
+
+    result = evaluate_real_market(
+        projection=request.projection,
+        line=request.line,
+        odds=request.odds,
+        confidence=request.confidence,
+        side=request.side,
+    )
+    return {
+        "player": request.player,
+        "market": request.market,
+        **result,
+        "motor": "Fútbol Analytics V2.2.9",
     }
 
 
