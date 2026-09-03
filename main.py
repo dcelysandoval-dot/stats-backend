@@ -2,17 +2,19 @@ import os
 import math
 import asyncio
 import logging
+import sqlite3
+import threading
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 
 # ============================================================
-# FÚTBOL ANALYTICS - BACKEND V2.3.1
+# FÚTBOL ANALYTICS - BACKEND V2.4.0
 # Sportmonks principal. Ya NO hay fallback a API-Football que reutilice
 # el mismo fixture_id (ver cambio #9 más abajo: eso es la causa del bug
 # de identificación de fixtures cruzados).
@@ -67,7 +69,7 @@ from pydantic import BaseModel, Field
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("futbol_analytics")
 
-APP_VERSION = "2.3.2"
+APP_VERSION = "2.4.0"
 # Sportmonks uses numeric season IDs (e.g. 28083), while API-Football
 # uses calendar years (e.g. 2026). Keep them separate.
 CURRENT_SEASON_YEAR = int(os.getenv("CURRENT_SEASON_YEAR", os.getenv("CURRENT_SEASON", "2026")))
@@ -135,12 +137,67 @@ MAX_STAKE_PERCENT = 3.0
 # instancias) esto se pierde o se desincroniza. Si el bet tracker debe
 # persistir de verdad, hay que moverlo a una base de datos (Postgres,
 # SQLite, etc.) en lugar de una lista/dict global.
-bets = []
-# Public picks are tracked separately from the legacy manual bet tracker.
-# They store the exact bookmaker market, model metrics, publication decision,
-# and settlement result used for the public Telegram history.
-public_picks = []
+# ============================================================
+# PERSISTENCIA + SEGURIDAD V2.4.0
+# ============================================================
+DB_PATH = os.getenv("DB_PATH", "futbol_analytics.db")
+_db_lock = threading.Lock()
+ADMIN_API_TOKEN = os.getenv("ADMIN_API_TOKEN", "").strip()
+SPORTMONKS_CONCURRENCY = max(1, int(os.getenv("SPORTMONKS_CONCURRENCY", "8")))
+_sportmonks_semaphore = asyncio.Semaphore(SPORTMONKS_CONCURRENCY)
 ALLOWED_BET_RESULTS = {"PENDIENTE", "GANADA", "PERDIDA", "ANULADA"}
+
+def _db_connect():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    with _db_lock, _db_connect() as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS bets (id INTEGER PRIMARY KEY AUTOINCREMENT,event TEXT NOT NULL,market TEXT NOT NULL,odds REAL NOT NULL,stake REAL NOT NULL,result TEXT NOT NULL DEFAULT 'PENDIENTE',created_at TEXT NOT NULL)""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS public_picks (id INTEGER PRIMARY KEY AUTOINCREMENT,published INTEGER NOT NULL DEFAULT 1,event TEXT NOT NULL,fixture_id INTEGER,player_id INTEGER,player TEXT NOT NULL,team TEXT,market TEXT NOT NULL,side TEXT NOT NULL,decision TEXT NOT NULL,line REAL NOT NULL,odds REAL NOT NULL,projection REAL NOT NULL,probability_fa REAL NOT NULL,implied_probability REAL NOT NULL,value_edge REAL NOT NULL,fa_rating REAL NOT NULL,confidence REAL NOT NULL,confirmed_lineup INTEGER NOT NULL DEFAULT 0,sample_sufficient_for_recommendation INTEGER NOT NULL DEFAULT 0,risk TEXT,signal TEXT,stake_units REAL NOT NULL DEFAULT 1.0,publishable INTEGER NOT NULL DEFAULT 1,result TEXT NOT NULL DEFAULT 'PENDIENTE',profit_units REAL,actual_stat REAL,auto_settled INTEGER NOT NULL DEFAULT 0,fixture_status TEXT,market_data_status TEXT,publication_reason TEXT,created_at TEXT NOT NULL,settled_at TEXT)""")
+        conn.commit()
+
+def _pick_row(row):
+    d=dict(row)
+    for k in ("published","confirmed_lineup","sample_sufficient_for_recommendation","publishable","auto_settled"):
+        d[k]=bool(d.get(k))
+    return d
+
+def db_insert_pick(pick):
+    with _db_lock, _db_connect() as conn:
+        cur=conn.execute("""INSERT INTO public_picks(published,event,fixture_id,player_id,player,team,market,side,decision,line,odds,projection,probability_fa,implied_probability,value_edge,fa_rating,confidence,confirmed_lineup,sample_sufficient_for_recommendation,risk,signal,stake_units,publishable,result,profit_units,market_data_status,publication_reason,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(int(pick.get('published',True)),pick['event'],pick.get('fixture_id'),pick.get('player_id'),pick['player'],pick.get('team'),pick['market'],pick['side'],pick['decision'],pick['line'],pick['odds'],pick['projection'],pick['probability_fa'],pick['implied_probability'],pick['value_edge'],pick['fa_rating'],pick['confidence'],int(pick.get('confirmed_lineup',False)),int(pick.get('sample_sufficient_for_recommendation',False)),pick.get('risk'),pick.get('signal'),pick.get('stake_units',1.0),int(pick.get('publishable',True)),pick.get('result','PENDIENTE'),pick.get('profit_units'),pick.get('market_data_status'),pick.get('publication_reason'),pick['created_at']))
+        conn.commit(); row=conn.execute('SELECT * FROM public_picks WHERE id=?',(cur.lastrowid,)).fetchone(); return _pick_row(row)
+
+def db_list_picks():
+    with _db_lock, _db_connect() as conn: return [_pick_row(r) for r in conn.execute('SELECT * FROM public_picks ORDER BY id ASC').fetchall()]
+
+def db_get_pick(pick_id):
+    with _db_lock, _db_connect() as conn:
+        r=conn.execute('SELECT * FROM public_picks WHERE id=?',(int(pick_id),)).fetchone(); return _pick_row(r) if r else None
+
+def db_settle_pick(pick_id,result,profit_units,extra=None):
+    extra=extra or {}
+    with _db_lock, _db_connect() as conn:
+        conn.execute('UPDATE public_picks SET result=?,profit_units=?,settled_at=?,actual_stat=COALESCE(?,actual_stat),auto_settled=?,fixture_status=COALESCE(?,fixture_status) WHERE id=?',(result,profit_units,datetime.now(timezone.utc).isoformat(),extra.get('actual_stat'),int(extra.get('auto_settled',False)),extra.get('fixture_status'),int(pick_id))); conn.commit()
+        r=conn.execute('SELECT * FROM public_picks WHERE id=?',(int(pick_id),)).fetchone()
+        if not r: raise ValueError('Pick no encontrado.')
+        return _pick_row(r)
+
+def db_insert_bet(bet):
+    with _db_lock, _db_connect() as conn:
+        cur=conn.execute('INSERT INTO bets(event,market,odds,stake,result,created_at) VALUES(?,?,?,?,?,?)',(bet['event'],bet['market'],bet['odds'],bet['stake'],bet['result'],bet['created_at'])); conn.commit(); return dict(conn.execute('SELECT * FROM bets WHERE id=?',(cur.lastrowid,)).fetchone())
+
+def db_list_bets():
+    with _db_lock, _db_connect() as conn: return [dict(r) for r in conn.execute('SELECT * FROM bets ORDER BY id ASC').fetchall()]
+
+def require_admin_token(x_admin_token: Optional[str] = Header(default=None)) -> None:
+    if not ADMIN_API_TOKEN:
+        raise HTTPException(status_code=503, detail='ADMIN_API_TOKEN no está configurado; endpoints de escritura deshabilitados.')
+    if not x_admin_token or x_admin_token != ADMIN_API_TOKEN:
+        raise HTTPException(status_code=401, detail='X-Admin-Token inválido o ausente.')
+
+init_db()
 PLAYER_STATS_CACHE = {}
 PLAYER_STATS_CACHE_TTL = 300
 RECENT_FORM_CACHE = {}
@@ -1876,86 +1933,36 @@ async def player_season(
             "source": "Sportmonks",
         }
 
-    # Fallback
-    fallback = await apifootball_get(
-        "/players",
-        {
-            "id": player_id,
-            "season": api_football_season_year(season),
-        },
+    logger.warning(
+        "player_season: Sportmonks no devolvió el player_id=%s. %s",
+        player_id, result.get("error"),
     )
-
-    if not fallback["ok"]:
-        return {
-            "status": "error",
-            "player_id": player_id,
-            "statistics": [],
-            "message": result["error"],
-            "fallback": fallback["error"],
-        }
-
-    response = fallback["data"].get("response", [])
-
-    if not response:
-        return {
-            "status": "no_data",
-            "player_id": player_id,
-            "statistics": [],
-            "message": "No existen estadísticas para este jugador.",
-        }
-
-    item = response[0]
-    player = item.get("player") or {}
-    stats = {}
-
-    for block in item.get("statistics") or []:
-        games = block.get("games") or {}
-        shots = block.get("shots") or {}
-        goals = block.get("goals") or {}
-        fouls = block.get("fouls") or {}
-        cards = block.get("cards") or {}
-
-        stats["minutes"] = safe_number(games.get("minutes"))
-        stats["appearances"] = safe_number(games.get("appearences"))
-        stats["starts"] = safe_number(games.get("lineups"))
-        stats["shots"] = safe_number(shots.get("total"))
-        stats["shots_on_target"] = safe_number(shots.get("on"))
-        stats["goals"] = safe_number(goals.get("total"))
-        stats["assists"] = safe_number(goals.get("assists"))
-        stats["fouls_committed"] = safe_number(fouls.get("committed"))
-        stats["fouls_drawn"] = safe_number(fouls.get("drawn"))
-        stats["yellow_cards"] = safe_number(cards.get("yellow"))
-
-    minutes = stats.get("minutes", 0)
-
-    def per90(value):
-        return round2(value / minutes * 90) if minutes else 0.0
-
-    normalized = {
-        "player_id": player.get("id"),
-        "player": player.get("name"),
-        "photo": player.get("photo"),
-        **{k: round2(v) for k, v in stats.items()},
-        "shots_per90": per90(stats.get("shots", 0)),
-        "shots_on_target_per90": per90(stats.get("shots_on_target", 0)),
-        "goals_per90": per90(stats.get("goals", 0)),
-        "assists_per90": per90(stats.get("assists", 0)),
-        "fouls_committed_per90": per90(stats.get("fouls_committed", 0)),
-        "fouls_drawn_per90": per90(stats.get("fouls_drawn", 0)),
-        "yellow_cards_per90": per90(stats.get("yellow_cards", 0)),
-    }
-
     return {
-        "status": "ok",
-        "season": api_football_season_year(season),
-        "player": normalized,
-        "source": "API-Football-fallback",
+        "status": "SPORTMONKS_PLAYER_UNAVAILABLE",
+        "player_id": player_id,
+        "statistics": [],
+        "message": (
+            "Sportmonks no pudo recuperar este jugador. No se usa API-Football "
+            "como respaldo porque los player_id de ambos proveedores no son "
+            "compatibles entre sí."
+        ),
+        "sportmonks_error": result.get("error"),
+        "source": "Sportmonks",
     }
 
 
 # ============================================================
 # FIXTURE ANALYSIS - SPORTMONKS
 # ============================================================
+
+async def collect_sportmonks_player_stats_limited(player_id, season_id):
+    async with _sportmonks_semaphore:
+        return await collect_sportmonks_player_stats(player_id, season_id)
+
+async def get_recent_player_form_limited(team_id, season_id, before_timestamp):
+    async with _sportmonks_semaphore:
+        return await get_recent_player_form(team_id, season_id, before_timestamp)
+
 
 async def fixture_analysis_sportmonks(
     fixture_id: int,
@@ -2030,7 +2037,7 @@ async def fixture_analysis_sportmonks(
     # que podía significar 30+ llamadas HTTP secuenciales a Sportmonks para
     # un solo fixture. Ahora se lanzan todas juntas con asyncio.gather.
     stats_tasks = [
-        collect_sportmonks_player_stats(
+        collect_sportmonks_player_stats_limited(
             entry.get("player_id"),
             int(season_id) if season_id else None,
         )
@@ -2154,7 +2161,7 @@ async def fixture_analysis_sportmonks(
         if p.get("team_id") is not None
     })
     recent_tasks = [
-        get_recent_player_form(
+        get_recent_player_form_limited(
             team_id,
             int(season_id),
             int(before_timestamp) if before_timestamp else None,
@@ -2239,7 +2246,7 @@ async def fixture_analysis_sportmonks(
             "minutos esperados; no incluyen cuotas de bookmaker."
         ),
         "source": "Sportmonks",
-        "motor": "Fútbol Analytics V2.3.1",
+        "motor": f"Fútbol Analytics {APP_VERSION}",
     }, None
 
 
@@ -2307,7 +2314,7 @@ async def fixture_analysis(
         "sportmonks_error": (error or {}).get("error"),
         "sportmonks_status_code": (error or {}).get("status_code"),
         "source": "Sportmonks",
-        "motor": "Fútbol Analytics V2.3.1",
+        "motor": f"Fútbol Analytics {APP_VERSION}",
     }
 
 
@@ -2793,10 +2800,10 @@ async def player_market_scan(
         "forced_six_picks": False,
         "candidates": candidates,
         "note": (
-            "V2.3.1 no inventa líneas ni cuotas. Las oportunidades del Scanner son estadísticas hasta recibir línea y cuota reales del bookmaker."
+            f"{APP_VERSION} no inventa líneas ni cuotas. Las oportunidades del Scanner son estadísticas hasta recibir línea y cuota reales del bookmaker."
         ),
         "source": analysis.get("source"),
-        "motor": "Fútbol Analytics V2.3.1",
+        "motor": f"Fútbol Analytics {APP_VERSION}",
         "confidence_policy": {
             "alta": "85-100",
             "media": "70-84",
@@ -2910,7 +2917,7 @@ def player_market_compare(request: BetPlayCompareRequest):
         "player": request.player,
         "market": request.market,
         **result,
-        "motor": "Fútbol Analytics V2.3.1",
+        "motor": f"Fútbol Analytics {APP_VERSION}",
     }
 
 
@@ -2942,7 +2949,7 @@ def player_market_evaluate(request: RealMarketRequest):
         "player": request.player,
         "market": request.market,
         **result,
-        "motor": "Fútbol Analytics V2.3.1",
+        "motor": f"Fútbol Analytics {APP_VERSION}",
     }
 
 
@@ -3022,7 +3029,7 @@ def scanner(request: ScannerRequest):
             if edge > 0
             else "SIN VALOR POSITIVO"
         ),
-        "motor": "Fútbol Analytics V2.3.1",
+        "motor": f"Fútbol Analytics {APP_VERSION}",
     }
 
 
@@ -3113,7 +3120,7 @@ def scanner_projection(
             if edge > 0
             else "SIN VALOR POSITIVO"
         ),
-        "motor": "Fútbol Analytics V2.3.1",
+        "motor": f"Fútbol Analytics {APP_VERSION}",
     }
 
 
@@ -3157,7 +3164,7 @@ def bankroll_calculator(request: BankrollRequest):
 
 
 # ============================================================
-# PERFORMANCE TRACKER V2.3.1 — PICKS GRATUITOS
+# PERFORMANCE TRACKER V2.4.0 — PICKS GRATUITOS
 # ============================================================
 
 PUBLIC_PICK_MIN_PROBABILITY = 60.0
@@ -3208,6 +3215,12 @@ def create_public_pick(data: dict) -> dict:
     missing = [key for key in required if key not in data]
     if missing:
         raise ValueError(f"Faltan campos obligatorios: {', '.join(missing)}")
+    if data.get("fixture_id") is None or data.get("player_id") is None:
+        raise ValueError("Un Pick Gratuito requiere fixture_id y player_id de Sportmonks para poder liquidarse con seguridad.")
+    if not bool(data.get("confirmed_lineup")):
+        raise ValueError("Un Pick Gratuito requiere titularidad confirmada.")
+    if not bool(data.get("sample_sufficient_for_recommendation")):
+        raise ValueError("Un Pick Gratuito requiere muestra estadística suficiente.")
 
     market = str(data["market"]).strip()
     if market not in SUPPORTED_MARKETS:
@@ -3232,9 +3245,7 @@ def create_public_pick(data: dict) -> dict:
             "evaluation": evaluated,
         }
 
-    next_id = max((int(p.get("id", 0)) for p in public_picks), default=0) + 1
     pick = {
-        "id": next_id,
         "published": True,
         "event": str(data["event"]).strip(),
         "fixture_id": int(data["fixture_id"]) if data.get("fixture_id") is not None else None,
@@ -3262,9 +3273,9 @@ def create_public_pick(data: dict) -> dict:
         "profit_units": None,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "market_data_status": "REAL",
-        "publication_reason": "Cumple filtro de Pick Gratuito V2.3.1.",
+        "publication_reason": "Cumple filtro de Pick Gratuito V2.4.0.",
     }
-    public_picks.append(pick)
+    pick = db_insert_pick(pick)
     return {"status": "created", "pick": pick}
 
 
@@ -3272,53 +3283,29 @@ def settle_public_pick(pick_id: int, result: str) -> dict:
     result = str(result).strip().upper()
     if result not in ALLOWED_BET_RESULTS:
         raise ValueError("result debe ser PENDIENTE, GANADA, PERDIDA o ANULADA.")
-
-    for pick in public_picks:
-        if int(pick.get("id")) != int(pick_id):
-            continue
-        pick["result"] = result
-        if result == "GANADA":
-            pick["profit_units"] = round2(pick["odds"] - 1.0)
-        elif result == "PERDIDA":
-            pick["profit_units"] = -1.0
-        elif result == "ANULADA":
-            pick["profit_units"] = 0.0
-        else:
-            pick["profit_units"] = None
-        pick["settled_at"] = datetime.now(timezone.utc).isoformat()
-        return {"status": "updated", "pick": pick}
-
-    raise ValueError("Pick no encontrado.")
-
+    pick = db_get_pick(pick_id)
+    if not pick:
+        raise ValueError("Pick no encontrado.")
+    if result == "GANADA":
+        profit = round2(pick["odds"] - 1.0)
+    elif result == "PERDIDA":
+        profit = -1.0
+    elif result == "ANULADA":
+        profit = 0.0
+    else:
+        profit = None
+    return {"status":"updated","pick":db_settle_pick(pick_id,result,profit)}
 
 def performance_kpis() -> dict:
-    """Calculate public-pick performance using one stake unit per pick."""
-    total = len(public_picks)
-    wins = sum(1 for p in public_picks if p.get("result") == "GANADA")
-    losses = sum(1 for p in public_picks if p.get("result") == "PERDIDA")
-    voids = sum(1 for p in public_picks if p.get("result") == "ANULADA")
-    pending = sum(1 for p in public_picks if p.get("result") == "PENDIENTE")
-    settled_actionable = wins + losses
-    profit_units = sum(
-        safe_number(p.get("profit_units"))
-        for p in public_picks
-        if p.get("result") in {"GANADA", "PERDIDA", "ANULADA"}
-    )
-    staked_units = float(settled_actionable)
-    hit_rate = (wins / settled_actionable * 100.0) if settled_actionable else 0.0
-    yield_percent = (profit_units / staked_units * 100.0) if staked_units else 0.0
-    return {
-        "picks": total,
-        "settled": settled_actionable + voids,
-        "pending": pending,
-        "wins": wins,
-        "losses": losses,
-        "voids": voids,
-        "hit_rate": round2(hit_rate),
-        "profit_units": round2(profit_units),
-        "yield": round2(yield_percent),
-    }
-
+    picks = db_list_picks()
+    total=len(picks)
+    wins=sum(1 for p in picks if p.get("result")=="GANADA")
+    losses=sum(1 for p in picks if p.get("result")=="PERDIDA")
+    voids=sum(1 for p in picks if p.get("result")=="ANULADA")
+    pending=sum(1 for p in picks if p.get("result")=="PENDIENTE")
+    profit=sum(safe_number(p.get("profit_units")) for p in picks if p.get("result") in {"GANADA","PERDIDA","ANULADA"})
+    settled_actionable=wins+losses
+    return {"picks":total,"settled":settled_actionable+voids,"pending":pending,"wins":wins,"losses":losses,"voids":voids,"hit_rate":round2(wins/settled_actionable*100 if settled_actionable else 0),"profit_units":round2(profit),"yield":round2(profit/settled_actionable*100 if settled_actionable else 0)}
 
 PUBLIC_PICK_STAT_TYPES = {
     "Remates": 42,
@@ -3336,26 +3323,13 @@ def _normalize_player_name(value: str) -> str:
 
 def _fixture_lineup_match_stat(fixture_item: dict, pick: dict) -> Optional[float]:
     target_player_id = pick.get("player_id")
-    target_name = _normalize_player_name(pick.get("player"))
     stat_type_id = PUBLIC_PICK_STAT_TYPES.get(str(pick.get("market")))
-    if stat_type_id is None:
+    if stat_type_id is None or target_player_id is None:
         return None
-
     for entry in fixture_item.get("lineups") or []:
         entry_id = entry.get("player_id") or (entry.get("player") or {}).get("id")
-        entry_name = _normalize_player_name(
-            entry.get("player_name")
-            or (entry.get("player") or {}).get("name")
-        )
-        same_id = (
-            target_player_id is not None
-            and entry_id is not None
-            and int(entry_id) == int(target_player_id)
-        )
-        same_name = bool(target_name) and entry_name == target_name
-        if not (same_id or same_name):
+        if entry_id is None or int(entry_id) != int(target_player_id):
             continue
-
         for detail in entry.get("details") or []:
             if int(safe_number(detail.get("type_id"))) != int(stat_type_id):
                 continue
@@ -3370,10 +3344,7 @@ async def auto_settle_public_picks() -> dict:
     Uses fixture state plus per-player lineup detail statistics. A pick is
     left PENDIENTE when the fixture, player, or stat cannot be resolved safely.
     """
-    pending = [
-        p for p in public_picks
-        if p.get("result") == "PENDIENTE" and p.get("fixture_id")
-    ]
+    pending = [p for p in db_list_picks() if p.get("result") == "PENDIENTE" and p.get("fixture_id")]
     if not pending:
         return {"status": "ok", "checked": 0, "updated": 0, "pending": 0, "errors": []}
 
@@ -3416,10 +3387,7 @@ async def auto_settle_public_picks() -> dict:
             continue
         line = safe_number(pick.get("line"))
         settle_result = "GANADA" if actual > line else "PERDIDA"
-        settle_public_pick(int(pick["id"]), settle_result)
-        pick["actual_stat"] = actual
-        pick["auto_settled"] = True
-        pick["fixture_status"] = "FINALIZADO"
+        db_settle_pick(int(pick["id"]), settle_result, round2(pick["odds"] - 1.0) if settle_result == "GANADA" else -1.0, {"actual_stat": actual, "auto_settled": True, "fixture_status": "FINALIZADO"})
         updated += 1
 
     return {
@@ -3427,24 +3395,24 @@ async def auto_settle_public_picks() -> dict:
         "checked": len(pending),
         "updated": updated,
         "skipped": skipped,
-        "pending": sum(1 for p in public_picks if p.get("result") == "PENDIENTE"),
+        "pending": sum(1 for p in db_list_picks() if p.get("result") == "PENDIENTE"),
         "errors": errors,
         "version": APP_VERSION,
     }
 
 
 @app.post("/api/public-picks/auto-settle")
-async def public_pick_auto_settle():
+async def public_pick_auto_settle(_: None = Depends(require_admin_token)):
     return await auto_settle_public_picks()
 
 
 @app.get("/api/public-picks/auto-settle")
-async def public_pick_auto_settle_get():
+async def public_pick_auto_settle_get(_: None = Depends(require_admin_token)):
     return await auto_settle_public_picks()
 
 
 @app.post("/api/public-picks")
-def public_pick_create(request: PublicPickRequest):
+def public_pick_create(request: PublicPickRequest, _: None = Depends(require_admin_token)):
     try:
         return create_public_pick(request.model_dump())
     except ValueError as exc:
@@ -3454,15 +3422,15 @@ def public_pick_create(request: PublicPickRequest):
 @app.get("/api/public-picks")
 def public_pick_list():
     return {
-        "count": len(public_picks),
-        "picks": public_picks,
+        "count": len(db_list_picks()),
+        "picks": db_list_picks(),
         "source": "Fútbol Analytics",
         "version": APP_VERSION,
     }
 
 
 @app.post("/api/public-picks/{pick_id}/result")
-def public_pick_result(pick_id: int, result: str):
+def public_pick_result(pick_id: int, result: str, _: None = Depends(require_admin_token)):
     try:
         return settle_public_pick(pick_id, result)
     except ValueError as exc:
@@ -3474,7 +3442,7 @@ def performance_tracker():
     return {
         "status": "ready",
         "kpis": performance_kpis(),
-        "picks": public_picks,
+        "picks": db_list_picks(),
         "publication_policy": {
             "probability_min": PUBLIC_PICK_MIN_PROBABILITY,
             "value_edge_min": PUBLIC_PICK_MIN_EDGE,
@@ -3501,98 +3469,25 @@ class BetRequest(BaseModel):
 
 
 @app.post("/api/bets")
-def create_bet(request: BetRequest):
+def create_bet(request: BetRequest, _: None = Depends(require_admin_token)):
     result = request.result.strip().upper()
     if result not in ALLOWED_BET_RESULTS:
-        raise HTTPException(
-            status_code=400,
-            detail="result debe ser PENDIENTE, GANADA, PERDIDA o ANULADA.",
-        )
-
-    bet = {
-        "id": len(bets) + 1,
-        "event": request.event,
-        "market": request.market,
-        "odds": request.odds,
-        "stake": request.stake,
-        "result": result,
-        "created_at": datetime.now(
-            timezone.utc
-        ).isoformat(),
-    }
-
-    bets.append(bet)
-
-    return {
-        "status": "created",
-        "bet": bet,
-    }
-
+        raise HTTPException(status_code=400, detail="result debe ser PENDIENTE, GANADA, PERDIDA o ANULADA.")
+    bet = {"event":request.event,"market":request.market,"odds":request.odds,"stake":request.stake,"result":result,"created_at":datetime.now(timezone.utc).isoformat()}
+    return {"status":"created","bet":db_insert_bet(bet)}
 
 @app.get("/api/bets")
 def get_bets():
-    return {
-        "count": len(bets),
-        "bets": bets,
-    }
-
+    rows=db_list_bets(); return {"count":len(rows),"bets":rows}
 
 @app.get("/api/kpis")
 def get_kpis():
-    total_bets = len(bets)
-
-    settled = [
-        bet for bet in bets
-        if bet["result"] in {
-            "GANADA",
-            "PERDIDA",
-            "ANULADA",
-        }
-    ]
-
-    total_staked = sum(
-        safe_number(bet["stake"])
-        for bet in settled
-    )
-
-    profit = 0.0
-    wins = 0
-    losses = 0
-    voids = 0
-
+    rows=db_list_bets(); settled=[b for b in rows if b["result"] in {"GANADA","PERDIDA","ANULADA"}]
+    total_staked=sum(safe_number(b["stake"]) for b in settled); profit=0.0; wins=losses=voids=0
     for bet in settled:
-        stake = safe_number(bet["stake"])
-        odds = safe_number(bet["odds"])
-        result = bet["result"]
+        stake=safe_number(b["stake"]); odds=safe_number(b["odds"])
+        if bet["result"]=="GANADA": profit += stake*(odds-1); wins += 1
+        elif bet["result"]=="PERDIDA": profit -= stake; losses += 1
+        elif bet["result"]=="ANULADA": voids += 1
+    return {"total_bets":len(rows),"settled_bets":len(settled),"profit":round2(profit),"yield":round2((profit/total_staked*100) if total_staked else 0),"win_rate":round2((wins/(wins+losses)*100) if wins+losses else 0),"wins":wins,"losses":losses,"voids":voids}
 
-        if result == "GANADA":
-            profit += stake * (odds - 1)
-            wins += 1
-        elif result == "PERDIDA":
-            profit -= stake
-            losses += 1
-        elif result == "ANULADA":
-            voids += 1
-
-    yield_percent = (
-        (profit / total_staked) * 100
-        if total_staked > 0
-        else 0
-    )
-
-    win_rate = (
-        (wins / (wins + losses)) * 100
-        if wins + losses > 0
-        else 0
-    )
-
-    return {
-        "total_bets": total_bets,
-        "settled_bets": len(settled),
-        "profit": round2(profit),
-        "yield": round2(yield_percent),
-        "win_rate": round2(win_rate),
-        "wins": wins,
-        "losses": losses,
-        "voids": voids,
-    }
