@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 
 
 # ============================================================
-# FÚTBOL ANALYTICS - BACKEND V2.2.9
+# FÚTBOL ANALYTICS - BACKEND V2.3.0
 # Sportmonks principal. Ya NO hay fallback a API-Football que reutilice
 # el mismo fixture_id (ver cambio #9 más abajo: eso es la causa del bug
 # de identificación de fixtures cruzados).
@@ -67,7 +67,7 @@ from pydantic import BaseModel, Field
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("futbol_analytics")
 
-APP_VERSION = "2.2.9"
+APP_VERSION = "2.3.0"
 # Sportmonks uses numeric season IDs (e.g. 28083), while API-Football
 # uses calendar years (e.g. 2026). Keep them separate.
 CURRENT_SEASON_YEAR = int(os.getenv("CURRENT_SEASON_YEAR", os.getenv("CURRENT_SEASON", "2026")))
@@ -136,6 +136,10 @@ MAX_STAKE_PERCENT = 3.0
 # persistir de verdad, hay que moverlo a una base de datos (Postgres,
 # SQLite, etc.) en lugar de una lista/dict global.
 bets = []
+# Public picks are tracked separately from the legacy manual bet tracker.
+# They store the exact bookmaker market, model metrics, publication decision,
+# and settlement result used for the public Telegram history.
+public_picks = []
 ALLOWED_BET_RESULTS = {"PENDIENTE", "GANADA", "PERDIDA", "ANULADA"}
 PLAYER_STATS_CACHE = {}
 PLAYER_STATS_CACHE_TTL = 300
@@ -1543,6 +1547,8 @@ def root():
             "player_market_scanner",
             "bankroll",
             "bet_tracker",
+            "performance_tracker",
+            "public_picks_telegram",
         ],
     }
 
@@ -2233,7 +2239,7 @@ async def fixture_analysis_sportmonks(
             "minutos esperados; no incluyen cuotas de bookmaker."
         ),
         "source": "Sportmonks",
-        "motor": "Fútbol Analytics V2.2.8",
+        "motor": "Fútbol Analytics V2.3.0",
     }, None
 
 
@@ -2301,7 +2307,7 @@ async def fixture_analysis(
         "sportmonks_error": (error or {}).get("error"),
         "sportmonks_status_code": (error or {}).get("status_code"),
         "source": "Sportmonks",
-        "motor": "Fútbol Analytics V2.2.8",
+        "motor": "Fútbol Analytics V2.3.0",
     }
 
 
@@ -2922,7 +2928,7 @@ def scanner(request: ScannerRequest):
             if edge > 0
             else "SIN VALOR POSITIVO"
         ),
-        "motor": "Fútbol Analytics V2.2.8",
+        "motor": "Fútbol Analytics V2.3.0",
     }
 
 
@@ -3013,7 +3019,7 @@ def scanner_projection(
             if edge > 0
             else "SIN VALOR POSITIVO"
         ),
-        "motor": "Fútbol Analytics V2.2.8",
+        "motor": "Fútbol Analytics V2.3.0",
     }
 
 
@@ -3053,6 +3059,205 @@ def bankroll_calculator(request: BankrollRequest):
             MAX_STAKE_PERCENT,
         ),
         "all_in_allowed": False,
+    }
+
+
+# ============================================================
+# PERFORMANCE TRACKER V2.3.0 — PICKS GRATUITOS
+# ============================================================
+
+PUBLIC_PICK_MIN_PROBABILITY = 60.0
+PUBLIC_PICK_MIN_EDGE = 2.0
+PUBLIC_PICK_MIN_RATING = 70
+PUBLIC_PICK_MIN_CONFIDENCE = 70.0
+
+
+class PublicPickRequest(BaseModel):
+    event: str
+    player: str
+    market: str
+    projection: float = Field(ge=0)
+    line: float = Field(gt=0)
+    odds: float = Field(gt=1)
+    confidence: float = Field(ge=0, le=100)
+    side: str = "over"
+
+
+def public_pick_eligibility(result: dict) -> tuple[bool, str]:
+    """Apply the free-pick publication gate to a real bookmaker market."""
+    if result.get("market_data_status") != "REAL":
+        return False, "MERCADO_REAL_REQUERIDO"
+    if result.get("decision") not in {"OVER", "UNDER"}:
+        return False, "NO_BET"
+    if safe_number(result.get("probability_fa")) < PUBLIC_PICK_MIN_PROBABILITY:
+        return False, "PROBABILIDAD_INSUFICIENTE"
+    if safe_number(result.get("value_edge")) < PUBLIC_PICK_MIN_EDGE:
+        return False, "VALUE_EDGE_INSUFICIENTE"
+    if safe_number(result.get("fa_rating")) < PUBLIC_PICK_MIN_RATING:
+        return False, "FA_RATING_INSUFICIENTE"
+    if safe_number(result.get("confidence")) < PUBLIC_PICK_MIN_CONFIDENCE:
+        return False, "CONFIANZA_INSUFICIENTE"
+    return True, "PUBLICABLE"
+
+
+def create_public_pick(data: dict) -> dict:
+    """Create a one-unit public pick only when a real market has value."""
+    if not isinstance(data, dict):
+        raise ValueError("Los datos del pick deben ser un dict.")
+
+    required = ("event", "player", "market", "projection", "line", "odds", "confidence")
+    missing = [key for key in required if key not in data]
+    if missing:
+        raise ValueError(f"Faltan campos obligatorios: {', '.join(missing)}")
+
+    market = str(data["market"]).strip()
+    if market not in SUPPORTED_MARKETS:
+        raise ValueError("Mercado no soportado.")
+
+    side = str(data.get("side", "over")).strip().lower()
+    if side not in {"over", "under"}:
+        raise ValueError("side debe ser 'over' o 'under'.")
+
+    evaluated = evaluate_real_market(
+        projection=safe_number(data["projection"]),
+        line=safe_number(data["line"]),
+        odds=safe_number(data["odds"]),
+        confidence=safe_number(data["confidence"]),
+        side=side,
+    )
+    eligible, reason = public_pick_eligibility(evaluated)
+    if not eligible:
+        return {
+            "status": "rejected",
+            "reason": reason,
+            "evaluation": evaluated,
+        }
+
+    next_id = max((int(p.get("id", 0)) for p in public_picks), default=0) + 1
+    pick = {
+        "id": next_id,
+        "published": True,
+        "event": str(data["event"]).strip(),
+        "player": str(data["player"]).strip(),
+        "market": market,
+        "side": evaluated["side"],
+        "decision": evaluated["decision"],
+        "line": evaluated["line"],
+        "odds": evaluated["odds"],
+        "projection": evaluated["projection"],
+        "probability_fa": evaluated["probability_fa"],
+        "implied_probability": evaluated["implied_probability"],
+        "value_edge": evaluated["value_edge"],
+        "fa_rating": evaluated["fa_rating"],
+        "confidence": evaluated["confidence"],
+        "risk": evaluated["risk"],
+        "signal": evaluated["signal"],
+        "stake_units": 1.0,
+        "publishable": True,
+        "result": "PENDIENTE",
+        "profit_units": None,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "market_data_status": "REAL",
+        "publication_reason": "Cumple filtro de Pick Gratuito V2.3.0.",
+    }
+    public_picks.append(pick)
+    return {"status": "created", "pick": pick}
+
+
+def settle_public_pick(pick_id: int, result: str) -> dict:
+    result = str(result).strip().upper()
+    if result not in ALLOWED_BET_RESULTS:
+        raise ValueError("result debe ser PENDIENTE, GANADA, PERDIDA o ANULADA.")
+
+    for pick in public_picks:
+        if int(pick.get("id")) != int(pick_id):
+            continue
+        pick["result"] = result
+        if result == "GANADA":
+            pick["profit_units"] = round2(pick["odds"] - 1.0)
+        elif result == "PERDIDA":
+            pick["profit_units"] = -1.0
+        elif result == "ANULADA":
+            pick["profit_units"] = 0.0
+        else:
+            pick["profit_units"] = None
+        pick["settled_at"] = datetime.now(timezone.utc).isoformat()
+        return {"status": "updated", "pick": pick}
+
+    raise ValueError("Pick no encontrado.")
+
+
+def performance_kpis() -> dict:
+    """Calculate public-pick performance using one stake unit per pick."""
+    total = len(public_picks)
+    wins = sum(1 for p in public_picks if p.get("result") == "GANADA")
+    losses = sum(1 for p in public_picks if p.get("result") == "PERDIDA")
+    voids = sum(1 for p in public_picks if p.get("result") == "ANULADA")
+    pending = sum(1 for p in public_picks if p.get("result") == "PENDIENTE")
+    settled_actionable = wins + losses
+    profit_units = sum(
+        safe_number(p.get("profit_units"))
+        for p in public_picks
+        if p.get("result") in {"GANADA", "PERDIDA", "ANULADA"}
+    )
+    staked_units = float(settled_actionable)
+    hit_rate = (wins / settled_actionable * 100.0) if settled_actionable else 0.0
+    yield_percent = (profit_units / staked_units * 100.0) if staked_units else 0.0
+    return {
+        "picks": total,
+        "settled": settled_actionable + voids,
+        "pending": pending,
+        "wins": wins,
+        "losses": losses,
+        "voids": voids,
+        "hit_rate": round2(hit_rate),
+        "profit_units": round2(profit_units),
+        "yield": round2(yield_percent),
+    }
+
+
+@app.post("/api/public-picks")
+def public_pick_create(request: PublicPickRequest):
+    try:
+        return create_public_pick(request.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/public-picks")
+def public_pick_list():
+    return {
+        "count": len(public_picks),
+        "picks": public_picks,
+        "source": "Fútbol Analytics",
+        "version": APP_VERSION,
+    }
+
+
+@app.post("/api/public-picks/{pick_id}/result")
+def public_pick_result(pick_id: int, result: str):
+    try:
+        return settle_public_pick(pick_id, result)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/performance-tracker")
+def performance_tracker():
+    return {
+        "status": "ready",
+        "kpis": performance_kpis(),
+        "picks": public_picks,
+        "publication_policy": {
+            "probability_min": PUBLIC_PICK_MIN_PROBABILITY,
+            "value_edge_min": PUBLIC_PICK_MIN_EDGE,
+            "fa_rating_min": PUBLIC_PICK_MIN_RATING,
+            "confidence_min": PUBLIC_PICK_MIN_CONFIDENCE,
+            "real_market_required": True,
+            "fixed_stake_units": 1,
+        },
+        "source": "Fútbol Analytics",
+        "version": APP_VERSION,
     }
 
 
