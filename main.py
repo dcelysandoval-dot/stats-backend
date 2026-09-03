@@ -67,7 +67,7 @@ from pydantic import BaseModel, Field
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("futbol_analytics")
 
-APP_VERSION = "2.3.1"
+APP_VERSION = "2.3.2"
 # Sportmonks uses numeric season IDs (e.g. 28083), while API-Football
 # uses calendar years (e.g. 2026). Keep them separate.
 CURRENT_SEASON_YEAR = int(os.getenv("CURRENT_SEASON_YEAR", os.getenv("CURRENT_SEASON", "2026")))
@@ -3175,6 +3175,11 @@ class PublicPickRequest(BaseModel):
     odds: float = Field(gt=1)
     confidence: float = Field(ge=0, le=100)
     side: str = "over"
+    fixture_id: Optional[int] = None
+    player_id: Optional[int] = None
+    team: Optional[str] = None
+    confirmed_lineup: bool = False
+    sample_sufficient_for_recommendation: bool = False
 
 
 def public_pick_eligibility(result: dict) -> tuple[bool, str]:
@@ -3232,7 +3237,10 @@ def create_public_pick(data: dict) -> dict:
         "id": next_id,
         "published": True,
         "event": str(data["event"]).strip(),
+        "fixture_id": int(data["fixture_id"]) if data.get("fixture_id") is not None else None,
+        "player_id": int(data["player_id"]) if data.get("player_id") is not None else None,
         "player": str(data["player"]).strip(),
+        "team": str(data.get("team") or "").strip() or None,
         "market": market,
         "side": evaluated["side"],
         "decision": evaluated["decision"],
@@ -3244,6 +3252,8 @@ def create_public_pick(data: dict) -> dict:
         "value_edge": evaluated["value_edge"],
         "fa_rating": evaluated["fa_rating"],
         "confidence": evaluated["confidence"],
+        "confirmed_lineup": bool(data.get("confirmed_lineup")),
+        "sample_sufficient_for_recommendation": bool(data.get("sample_sufficient_for_recommendation")),
         "risk": evaluated["risk"],
         "signal": evaluated["signal"],
         "stake_units": 1.0,
@@ -3308,6 +3318,129 @@ def performance_kpis() -> dict:
         "profit_units": round2(profit_units),
         "yield": round2(yield_percent),
     }
+
+
+PUBLIC_PICK_STAT_TYPES = {
+    "Remates": 42,
+    "Goles": 52,
+    "Faltas": 56,
+    "Asistencias": 79,
+    "Tarjetas": 84,
+    "Remates a puerta": 86,
+}
+
+
+def _normalize_player_name(value: str) -> str:
+    return " ".join(str(value or "").strip().casefold().split())
+
+
+def _fixture_lineup_match_stat(fixture_item: dict, pick: dict) -> Optional[float]:
+    target_player_id = pick.get("player_id")
+    target_name = _normalize_player_name(pick.get("player"))
+    stat_type_id = PUBLIC_PICK_STAT_TYPES.get(str(pick.get("market")))
+    if stat_type_id is None:
+        return None
+
+    for entry in fixture_item.get("lineups") or []:
+        entry_id = entry.get("player_id") or (entry.get("player") or {}).get("id")
+        entry_name = _normalize_player_name(
+            entry.get("player_name")
+            or (entry.get("player") or {}).get("name")
+        )
+        same_id = (
+            target_player_id is not None
+            and entry_id is not None
+            and int(entry_id) == int(target_player_id)
+        )
+        same_name = bool(target_name) and entry_name == target_name
+        if not (same_id or same_name):
+            continue
+
+        for detail in entry.get("details") or []:
+            if int(safe_number(detail.get("type_id"))) != int(stat_type_id):
+                continue
+            return round2(lineup_detail_value(detail))
+        return 0.0
+    return None
+
+
+async def auto_settle_public_picks() -> dict:
+    """Settle pending public picks from completed Sportmonks fixtures.
+
+    Uses fixture state plus per-player lineup detail statistics. A pick is
+    left PENDIENTE when the fixture, player, or stat cannot be resolved safely.
+    """
+    pending = [
+        p for p in public_picks
+        if p.get("result") == "PENDIENTE" and p.get("fixture_id")
+    ]
+    if not pending:
+        return {"status": "ok", "checked": 0, "updated": 0, "pending": 0, "errors": []}
+
+    fixture_ids = sorted({int(p["fixture_id"]) for p in pending})
+
+    async def fetch_fixture(fid: int):
+        return fid, await sportmonks_fixture(
+            fid,
+            "participants;league;season;state;lineups.details.type",
+        )
+
+    results = await asyncio.gather(
+        *(fetch_fixture(fid) for fid in fixture_ids),
+        return_exceptions=True,
+    )
+    by_fixture = {}
+    errors = []
+    for result in results:
+        if isinstance(result, Exception):
+            errors.append(str(result))
+            continue
+        fid, payload = result
+        by_fixture[fid] = payload
+
+    updated = 0
+    skipped = 0
+    for pick in pending:
+        fid = int(pick["fixture_id"])
+        payload = by_fixture.get(fid) or {}
+        if not payload.get("ok"):
+            skipped += 1
+            continue
+        fixture_item = payload.get("data", {}).get("data") or {}
+        if not fixture_is_completed(fixture_item):
+            skipped += 1
+            continue
+        actual = _fixture_lineup_match_stat(fixture_item, pick)
+        if actual is None:
+            skipped += 1
+            continue
+        line = safe_number(pick.get("line"))
+        settle_result = "GANADA" if actual > line else "PERDIDA"
+        settle_public_pick(int(pick["id"]), settle_result)
+        pick["actual_stat"] = actual
+        pick["auto_settled"] = True
+        pick["fixture_status"] = "FINALIZADO"
+        updated += 1
+
+    return {
+        "status": "ok",
+        "checked": len(pending),
+        "updated": updated,
+        "skipped": skipped,
+        "pending": sum(1 for p in public_picks if p.get("result") == "PENDIENTE"),
+        "errors": errors,
+        "version": APP_VERSION,
+    }
+
+
+@app.post("/api/public-picks/auto-settle")
+async def public_pick_auto_settle():
+    return await auto_settle_public_picks()
+
+
+@app.get("/api/public-picks/auto-settle")
+async def public_pick_auto_settle_get():
+    return await auto_settle_public_picks()
 
 
 @app.post("/api/public-picks")
