@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 
 
 # ============================================================
-# FÚTBOL ANALYTICS - BACKEND V2.3.0
+# FÚTBOL ANALYTICS - BACKEND V2.3.1
 # Sportmonks principal. Ya NO hay fallback a API-Football que reutilice
 # el mismo fixture_id (ver cambio #9 más abajo: eso es la causa del bug
 # de identificación de fixtures cruzados).
@@ -67,7 +67,7 @@ from pydantic import BaseModel, Field
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("futbol_analytics")
 
-APP_VERSION = "2.3.0"
+APP_VERSION = "2.3.1"
 # Sportmonks uses numeric season IDs (e.g. 28083), while API-Football
 # uses calendar years (e.g. 2026). Keep them separate.
 CURRENT_SEASON_YEAR = int(os.getenv("CURRENT_SEASON_YEAR", os.getenv("CURRENT_SEASON", "2026")))
@@ -2239,7 +2239,7 @@ async def fixture_analysis_sportmonks(
             "minutos esperados; no incluyen cuotas de bookmaker."
         ),
         "source": "Sportmonks",
-        "motor": "Fútbol Analytics V2.3.0",
+        "motor": "Fútbol Analytics V2.3.1",
     }, None
 
 
@@ -2307,7 +2307,7 @@ async def fixture_analysis(
         "sportmonks_error": (error or {}).get("error"),
         "sportmonks_status_code": (error or {}).get("status_code"),
         "source": "Sportmonks",
-        "motor": "Fútbol Analytics V2.3.0",
+        "motor": "Fútbol Analytics V2.3.1",
     }
 
 
@@ -2793,10 +2793,10 @@ async def player_market_scan(
         "forced_six_picks": False,
         "candidates": candidates,
         "note": (
-            "V2.2.9 no inventa líneas ni cuotas. Las oportunidades del Scanner son estadísticas hasta recibir línea y cuota reales del bookmaker."
+            "V2.3.1 no inventa líneas ni cuotas. Las oportunidades del Scanner son estadísticas hasta recibir línea y cuota reales del bookmaker."
         ),
         "source": analysis.get("source"),
-        "motor": "Fútbol Analytics V2.2.9",
+        "motor": "Fútbol Analytics V2.3.1",
         "confidence_policy": {
             "alta": "85-100",
             "media": "70-84",
@@ -2822,6 +2822,98 @@ async def player_market_scan(
     }
 
 
+class BetPlayOffer(BaseModel):
+    line: float = Field(gt=0)
+    odds: float = Field(gt=1)
+
+
+class BetPlayCompareRequest(BaseModel):
+    player: str = "Jugador"
+    market: str
+    projection: float = Field(ge=0)
+    confidence: float = Field(default=70, ge=0, le=100)
+    offers: list[BetPlayOffer] = Field(min_length=1, max_length=20)
+
+
+def evaluate_betplay_over_markets(
+    projection: float,
+    confidence: float,
+    offers: list[dict],
+    side: str = "over",
+) -> dict:
+    """Compara únicamente mercados OVER reales de jugadores de BetPlay."""
+    if str(side).strip().lower() != "over":
+        raise ValueError("Los mercados estadísticos de jugadores de BetPlay se modelan como OVER únicamente.")
+    if not offers:
+        raise ValueError("Debes proporcionar al menos una línea OVER real de BetPlay.")
+
+    seen_lines = set()
+    evaluated = []
+    projection = safe_number(projection)
+    confidence = safe_number(confidence) or 50
+    for offer in offers:
+        line = safe_number(offer.get("line"))
+        odds = safe_number(offer.get("odds"))
+        if line <= 0 or odds <= 1:
+            raise ValueError("Cada línea debe ser > 0 y cada cuota debe ser > 1.")
+        line_key = round(line, 3)
+        if line_key in seen_lines:
+            raise ValueError("No se permiten líneas OVER duplicadas.")
+        seen_lines.add(line_key)
+
+        probability = probability_over(line, projection, confidence)
+        edge = value_edge(probability, odds)
+        rating = fa_rating(probability, edge, confidence)
+        evaluated.append({
+            "side": "OVER",
+            "line": round2(line),
+            "odds": round2(odds),
+            "probability_fa": round2(probability),
+            "implied_probability": implied_probability(odds),
+            "value_edge": edge,
+            "fa_rating": rating,
+            "risk": risk_from_rating(rating),
+            "signal": signal_from_edge(edge),
+            "value_positive": edge > 0,
+        })
+
+    evaluated.sort(key=lambda x: (x["value_edge"], x["probability_fa"], x["fa_rating"]), reverse=True)
+    best = evaluated[0]
+    return {
+        "market_data_status": "REAL",
+        "side": "OVER",
+        "projection": round2(projection),
+        "confidence": round2(confidence),
+        "offers": evaluated,
+        "best": best,
+        "decision": "OVER" if best["value_edge"] > 0 else "NO BET",
+        "value_positive": best["value_edge"] > 0,
+        "recommendation": "OPORTUNIDAD CON VALOR" if best["value_edge"] > 0 else "SIN VALOR POSITIVO",
+        "note": "Se compararon únicamente líneas y cuotas OVER reales entregadas por BetPlay; Fútbol Analytics no genera líneas ni cuotas.",
+    }
+
+
+@app.post("/api/player-market-compare")
+def player_market_compare(request: BetPlayCompareRequest):
+    if request.market not in SUPPORTED_MARKETS:
+        raise HTTPException(status_code=400, detail="Mercado no soportado.")
+    try:
+        result = evaluate_betplay_over_markets(
+            projection=request.projection,
+            confidence=request.confidence,
+            offers=[offer.model_dump() for offer in request.offers],
+            side="over",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "player": request.player,
+        "market": request.market,
+        **result,
+        "motor": "Fútbol Analytics V2.3.1",
+    }
+
+
 class RealMarketRequest(BaseModel):
     player: str
     market: str
@@ -2829,26 +2921,28 @@ class RealMarketRequest(BaseModel):
     line: float = Field(gt=0)
     odds: float = Field(gt=1)
     confidence: float = Field(default=70, ge=0, le=100)
-    side: str = "auto"
+    side: str = "over"
 
 
 @app.post("/api/player-market-evaluate")
 def player_market_evaluate(request: RealMarketRequest):
     if request.market not in SUPPORTED_MARKETS:
         raise HTTPException(status_code=400, detail="Mercado no soportado.")
+    if request.side.strip().lower() != "over":
+        raise HTTPException(status_code=400, detail="Los mercados estadísticos de jugadores de BetPlay se modelan como OVER únicamente.")
 
     result = evaluate_real_market(
         projection=request.projection,
         line=request.line,
         odds=request.odds,
         confidence=request.confidence,
-        side=request.side,
+        side="over",
     )
     return {
         "player": request.player,
         "market": request.market,
         **result,
-        "motor": "Fútbol Analytics V2.2.9",
+        "motor": "Fútbol Analytics V2.3.1",
     }
 
 
@@ -2928,7 +3022,7 @@ def scanner(request: ScannerRequest):
             if edge > 0
             else "SIN VALOR POSITIVO"
         ),
-        "motor": "Fútbol Analytics V2.3.0",
+        "motor": "Fútbol Analytics V2.3.1",
     }
 
 
@@ -3019,7 +3113,7 @@ def scanner_projection(
             if edge > 0
             else "SIN VALOR POSITIVO"
         ),
-        "motor": "Fútbol Analytics V2.3.0",
+        "motor": "Fútbol Analytics V2.3.1",
     }
 
 
@@ -3063,7 +3157,7 @@ def bankroll_calculator(request: BankrollRequest):
 
 
 # ============================================================
-# PERFORMANCE TRACKER V2.3.0 — PICKS GRATUITOS
+# PERFORMANCE TRACKER V2.3.1 — PICKS GRATUITOS
 # ============================================================
 
 PUBLIC_PICK_MIN_PROBABILITY = 60.0
@@ -3087,7 +3181,7 @@ def public_pick_eligibility(result: dict) -> tuple[bool, str]:
     """Apply the free-pick publication gate to a real bookmaker market."""
     if result.get("market_data_status") != "REAL":
         return False, "MERCADO_REAL_REQUERIDO"
-    if result.get("decision") not in {"OVER", "UNDER"}:
+    if result.get("decision") != "OVER":
         return False, "NO_BET"
     if safe_number(result.get("probability_fa")) < PUBLIC_PICK_MIN_PROBABILITY:
         return False, "PROBABILIDAD_INSUFICIENTE"
@@ -3115,15 +3209,15 @@ def create_public_pick(data: dict) -> dict:
         raise ValueError("Mercado no soportado.")
 
     side = str(data.get("side", "over")).strip().lower()
-    if side not in {"over", "under"}:
-        raise ValueError("side debe ser 'over' o 'under'.")
+    if side != "over":
+        raise ValueError("Los mercados de jugadores de BetPlay se publican como OVER únicamente.")
 
     evaluated = evaluate_real_market(
         projection=safe_number(data["projection"]),
         line=safe_number(data["line"]),
         odds=safe_number(data["odds"]),
         confidence=safe_number(data["confidence"]),
-        side=side,
+        side="over",
     )
     eligible, reason = public_pick_eligibility(evaluated)
     if not eligible:
@@ -3158,7 +3252,7 @@ def create_public_pick(data: dict) -> dict:
         "profit_units": None,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "market_data_status": "REAL",
-        "publication_reason": "Cumple filtro de Pick Gratuito V2.3.0.",
+        "publication_reason": "Cumple filtro de Pick Gratuito V2.3.1.",
     }
     public_picks.append(pick)
     return {"status": "created", "pick": pick}
